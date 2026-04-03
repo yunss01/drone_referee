@@ -4,11 +4,6 @@ install/
 log/
 __pycache__/
 *.bag
-build/
-devel/
-install/
-log/
-__pycache__/
 *.mp4
 drone_Referee.v2i.yolov8/
 wheel_runs2/
@@ -16,3 +11,8 @@ test_results/
 test/
 frames_clahe2/
 frames_raw/
+UnLanedet/detect_results/
+UnLanedet/detect_results_adnet/
+UnLanedet/detect_results_adnet_low_conf/
+UnLanedet/detect_results_finetuned/
+dataset/drone_lane/
