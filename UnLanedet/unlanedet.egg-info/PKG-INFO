@@ -1,0 +1,17 @@
+Metadata-Version: 2.1
+Name: unlanedet
+Version: 0.0.2
+Summary: A Tookit for lane detection based on PyTorch
+Home-page: https://github.com/zkyntu/UnLanedet
+Author: kunyangzhou
+Author-email: zhoukunyangmcgill@163.com
+License: Apache 2.0 license
+Platform: UNKNOWN
+Classifier: Programming Language :: Python :: 3
+Classifier: License :: OSI Approved :: Apache 2.0 license
+Classifier: Operating System :: OS Independent
+Description-Content-Type: text/plain
+License-File: LICENSE
+
+A Tookit for lane detection based on PyTorch
+

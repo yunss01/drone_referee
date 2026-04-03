@@ -1,0 +1,13 @@
+fvcore
+cloudpickle
+omegaconf
+scikit-learn
+albumentations==0.4.6
+shapely
+imgaug==0.4.0
+albucore
+scikit-image
+p_tqdm
+tensorboard
+timm
+einops
