@@ -16,3 +16,8 @@ UnLanedet/detect_results_adnet/
 UnLanedet/detect_results_adnet_low_conf/
 UnLanedet/detect_results_finetuned/
 dataset/drone_lane/
+*.pth
+UnLanedet/output/
+UnLanedet/pretrained/
+UnLanedet/.eggs/
+UnLanedet/build/
