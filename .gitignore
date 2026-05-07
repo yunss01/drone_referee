@@ -21,3 +21,7 @@ UnLanedet/output/
 UnLanedet/pretrained/
 UnLanedet/.eggs/
 UnLanedet/build/
+segmentation\ DL\ model/drone_Referee_line_seg.v1i.yolov8/
+result*.jpg
+*.pkl
+dataset/

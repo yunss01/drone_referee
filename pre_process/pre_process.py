@@ -37,8 +37,8 @@ def extract_frames_with_clahe(video_path, output_dir, fps=10,
 
 if __name__ == "__main__":
     extract_frames_with_clahe(
-        video_path="한 바퀴.mp4",
-        output_dir="frames_clahe2/",
+        video_path="5.mp4",
+        output_dir="frames_clahe/",
         fps=10,
         clip_limit=2.0,    # 높을수록 대비 강해짐 (1.5~3.0 권장)
         tile_size=(4, 4)   # 작을수록 로컬 대비 강해짐
