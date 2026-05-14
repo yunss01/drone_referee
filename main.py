@@ -2,15 +2,20 @@
 main.py  —  드론 심판 시스템 통합 실행
 
 MODE 설정:
-  'camera' : USB 카메라 실시간 (preprocess.py의 CAM_NUM 사용)
+  'camera' : USB 카메라 실시간
   'video'  : 영상 파일 처리 후 결과 영상 저장
   'image'  : 이미지 1장 또는 폴더 전체 처리 후 저장
+
+재위치 토글:
+  터미널에서 Enter 키 → 재위치 모드 ON/OFF
+  재위치 모드 ON 중에는 침범 판정이 일시정지됨
 
 종료: 'q' 키 (camera/video 모드)
 """
 
 import os
 import cv2
+import threading
 import numpy as np
 from ultralytics import YOLO
 
@@ -25,27 +30,59 @@ from violation_tracker import ViolationTracker
 
 # ──────────────────────────────────────────────────────────
 #  모드 설정
-#
-#  MODE = 'camera' : USB 카메라 실시간
-#  MODE = 'video'  : 영상 파일 처리
-#  MODE = 'image'  : 이미지 1장 또는 폴더
 # ──────────────────────────────────────────────────────────
 MODE = 'video'
 
-# [video 모드] 입력 영상 / 출력 영상
-VIDEO_INPUT  = "dataset/3배_4.MP4"
-VIDEO_OUTPUT = "result_video.mp4"
+VIDEO_INPUT  = "dataset/3배_2.MP4"
+VIDEO_OUTPUT = "result_video_2.mp4"
 
-# [image 모드] 이미지 1장 또는 폴더 경로 / 출력 폴더
-IMAGE_INPUT  = "test.jpg"          # 파일 or 폴더
-IMAGE_OUTPUT = "result_images/"
+IMAGE_INPUT  = "test.jpg"
+IMAGE_OUTPUT = "result_images_2/"
 
-# ── 공통 설정 ──────────────────────────────────────────────
-SEG_MODEL_PATH  = "best_seg_rev01.pt"
+SEG_MODEL_PATH  = "best_seg_rev02.pt"
 POSE_MODEL_PATH = "best_referee.pt"
 MAX_WHEELS      = 4
-SHOW_WINDOW     = False   # True: 화면 출력, False: 파일 저장만
+SHOW_WINDOW     = False
 # ──────────────────────────────────────────────────────────
+
+
+# ── 재위치 토글 상태 관리 ────────────────────────────────
+class RefereeState:
+    """
+    재위치 모드 토글을 스레드 안전하게 관리.
+    터미널에서 Enter 키를 누르면 paused가 반전됨.
+    """
+    def __init__(self):
+        self._lock  = threading.Lock()
+        self._paused = False
+
+    @property
+    def paused(self):
+        with self._lock:
+            return self._paused
+
+    def toggle(self):
+        with self._lock:
+            self._paused = not self._paused
+        status = "⏸  재위치 모드 ON  (침범 판정 일시정지)" if self._paused \
+                 else "▶  재위치 모드 OFF (침범 판정 재개)"
+        print(f"\n[토글] {status}\n")
+
+
+def start_input_listener(state: RefereeState):
+    """백그라운드 스레드: 터미널 Enter 입력 대기 → 토글"""
+    print("💡 터미널에서 Enter 키를 누르면 재위치 모드 ON/OFF 전환")
+
+    def _listen():
+        while True:
+            try:
+                input()
+                state.toggle()
+            except EOFError:
+                break   # 파이프 입력 등으로 stdin이 닫힌 경우
+
+    t = threading.Thread(target=_listen, daemon=True)
+    t.start()
 
 
 # ── 차선 데이터 구성 (Step 1~4) ──────────────────────────
@@ -61,7 +98,9 @@ def build_lane_data(seg_model, frame):
 
         half_width = get_instance_half_width(contours)
         largest    = max(contours, key=cv2.contourArea)
-        centerline = get_centerline(largest)
+        centerline = get_centerline(mask_bin)
+        if centerline is None:   # 비율 불안정 → skip
+            continue
 
         lane_data.append({
             "mask_bin"  : mask_bin,
@@ -74,7 +113,7 @@ def build_lane_data(seg_model, frame):
 
 
 # ── 시각화 ───────────────────────────────────────────────
-def draw_frame(frame, lane_data, wheels, tracker_states):
+def draw_frame(frame, lane_data, wheels, tracker_states, paused):
     vis = frame.copy()
 
     # 차선 마스크 오버레이
@@ -86,12 +125,11 @@ def draw_frame(frame, lane_data, wheels, tracker_states):
         pt1, pt2 = data["centerline"]
         cv2.line(vis, pt1, pt2, color, 2)
 
-    # 바퀴 bbox + 접지점
+    # 바퀴 bbox + 접지점 (② conf/KP 레이블 제거)
     any_confirmed = False
     for wheel, state in zip(wheels, tracker_states):
         x1, y1, x2, y2 = wheel["bbox"]
         kx, ky          = wheel["keypoint"]
-        kp_valid        = wheel["kp_valid"]
         confirmed       = state["confirmed"]
         violated        = state["violated"]
 
@@ -102,7 +140,7 @@ def draw_frame(frame, lane_data, wheels, tracker_states):
             bbox_color = (0, 0, 255)
         elif violated:
             bbox_color = (0, 128, 255)
-        elif kp_valid:
+        elif wheel["kp_valid"]:
             bbox_color = (0, 255, 0)
         else:
             bbox_color = (0, 215, 255)
@@ -110,19 +148,23 @@ def draw_frame(frame, lane_data, wheels, tracker_states):
         cv2.rectangle(vis, (x1, y1), (x2, y2), bbox_color, 2)
         cv2.circle(vis, (kx, ky), 5, (0, 0, 255), -1)
 
-        label = f"{'KP' if kp_valid else 'FB'} {wheel['conf']:.2f}"
-        cv2.putText(vis, label, (x1, y1 - 6),
-                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, bbox_color, 1)
-
+        # 침범 확정 시 지속 시간 표시
         if confirmed:
             cv2.putText(vis, f"VIOLATION {state['duration']*1000:.0f}ms",
                         (x1, y2 + 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
 
-    status       = "VIOLATION" if any_confirmed else "NORMAL"
-    status_color = (0, 0, 255) if any_confirmed else (0, 255, 0)
-    cv2.putText(vis, status, (10, 40),
-                cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
+    # 상단 상태 표시
+    if paused:
+        # 재위치 모드 중: 노란색으로 표시
+        cv2.putText(vis, "REPOSITIONING", (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
+    else:
+        status       = "VIOLATION" if any_confirmed else "NORMAL"
+        status_color = (0, 0, 255) if any_confirmed else (0, 255, 0)
+        cv2.putText(vis, status, (10, 40),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
+
     cv2.putText(vis, f"wheels:{len(wheels)}  lanes:{len(lane_data)}",
                 (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                 (255, 255, 255), 2)
@@ -131,27 +173,37 @@ def draw_frame(frame, lane_data, wheels, tracker_states):
 
 
 # ── 프레임 1장 처리 ──────────────────────────────────────
-def process_frame(seg_model, wheel_det, trackers, frame):
+def process_frame(seg_model, wheel_det, trackers, frame, state: RefereeState):
     lane_data = build_lane_data(seg_model, frame)
     wheels    = wheel_det.predict(frame)
+    paused    = state.paused
 
     tracker_states = []
     for w_idx, wheel in enumerate(wheels[:MAX_WHEELS]):
-        kx, ky = wheel["keypoint"]
-        compute_distances(lane_data, kx, ky)
-        viol_results   = check_violation(lane_data)
-        frame_violated = any(vr["violated"] for vr in viol_results)
-        state          = trackers[w_idx].update(frame_violated)
-        tracker_states.append(state)
+        if paused:
+            # 재위치 모드: tracker 초기화하고 정상 상태 반환
+            trackers[w_idx].reset()
+            tracker_states.append({
+                "wheel_id" : w_idx,
+                "violated" : False,
+                "confirmed": False,
+                "duration" : 0.0,
+            })
+        else:
+            kx, ky = wheel["keypoint"]
+            compute_distances(lane_data, kx, ky)
+            viol_results   = check_violation(lane_data)
+            frame_violated = any(vr["violated"] for vr in viol_results)
+            tracker_states.append(trackers[w_idx].update(frame_violated))
 
     for i in range(len(wheels), MAX_WHEELS):
         trackers[i].reset()
 
-    vis = draw_frame(frame, lane_data, wheels[:MAX_WHEELS], tracker_states)
+    vis = draw_frame(frame, lane_data, wheels[:MAX_WHEELS], tracker_states, paused)
     return vis
 
 
-# ── 모델 / tracker 초기화 공통 ───────────────────────────
+# ── 모델 / tracker 초기화 ────────────────────────────────
 def load_models():
     print("🔍 모델 로딩 중...")
     seg_model = YOLO(SEG_MODEL_PATH)
@@ -162,12 +214,12 @@ def load_models():
 
 
 # ── camera 모드 ───────────────────────────────────────────
-def run_camera():
+def run_camera(state):
     seg_model, wheel_det, trackers = load_models()
     print("🎥 카메라 모드 시작. 종료: 'q'")
 
     for frame in camera_stream():
-        vis = process_frame(seg_model, wheel_det, trackers, frame)
+        vis = process_frame(seg_model, wheel_det, trackers, frame, state)
 
         if SHOW_WINDOW:
             cv2.imshow("Drone Referee", vis)
@@ -180,7 +232,7 @@ def run_camera():
 
 
 # ── video 모드 ────────────────────────────────────────────
-def run_video():
+def run_video(state):
     seg_model, wheel_det, trackers = load_models()
 
     cap = cv2.VideoCapture(VIDEO_INPUT)
@@ -206,7 +258,7 @@ def run_video():
             break
 
         frame = _apply_clahe(frame, clahe)
-        vis   = process_frame(seg_model, wheel_det, trackers, frame)
+        vis   = process_frame(seg_model, wheel_det, trackers, frame, state)
         out.write(vis)
 
         frame_idx += 1
@@ -226,10 +278,9 @@ def run_video():
 
 
 # ── image 모드 ────────────────────────────────────────────
-def run_image():
+def run_image(state):
     seg_model, wheel_det, trackers = load_models()
 
-    # 단일 파일 or 폴더 판별
     if os.path.isfile(IMAGE_INPUT):
         img_files = [IMAGE_INPUT]
         out_dir   = IMAGE_OUTPUT if IMAGE_OUTPUT else "result_images/"
@@ -255,12 +306,11 @@ def run_image():
             print(f"  스킵 (읽기 실패): {fpath}")
             continue
 
-        # 이미지 모드에서는 tracker를 매 이미지마다 초기화
         for t in trackers:
             t.reset()
 
         frame = _apply_clahe(frame, clahe)
-        vis   = process_frame(seg_model, wheel_det, trackers, frame)
+        vis   = process_frame(seg_model, wheel_det, trackers, frame, state)
 
         fname    = os.path.basename(fpath)
         out_path = os.path.join(out_dir, f"result_{fname}")
@@ -279,11 +329,14 @@ def run_image():
 
 # ── 진입점 ───────────────────────────────────────────────
 if __name__ == "__main__":
+    state = RefereeState()
+    start_input_listener(state)
+
     if MODE == 'camera':
-        run_camera()
+        run_camera(state)
     elif MODE == 'video':
-        run_video()
+        run_video(state)
     elif MODE == 'image':
-        run_image()
+        run_image(state)
     else:
         print(f"❌ 알 수 없는 MODE: '{MODE}' → 'camera' / 'video' / 'image'")

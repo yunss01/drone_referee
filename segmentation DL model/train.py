@@ -3,7 +3,7 @@ from ultralytics import YOLO
 
 def main():
     # 데이터셋 경로 (Roboflow에서 받은 데이터셋으로 변경)
-    data_path = "/home/sukja/drone_Referee/segmentation DL model/drone_Referee_line_seg.v1i.yolov8/data.yaml"
+    data_path = "/home/sukja/drone_Referee/segmentation DL model/drone_Referee_line_seg.v2i.yolov11/data.yaml"
 
     print("🚀 차선 segmentation 모델 학습을 시작합니다!")
     
@@ -40,7 +40,7 @@ def main():
         mosaic=1.0,         # 여러 이미지 합성 (기본값, 소량 데이터에 효과적)
         
         project="line_seg",
-        name="rev02",
+        name="rev03",
         save=True
     )
 

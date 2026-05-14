@@ -24,6 +24,12 @@ IMGSZ          = 1280   # 추론 해상도
 MIN_AREA       = 200    # 이보다 작은 마스크 조각은 노이즈로 제거 (px²)
 MAX_HALF_WIDTH = 50     # 반폭 상한 클리핑 (px)
 
+# ① 결과에서 제외할 클래스명 (모델의 class 이름과 정확히 일치해야 함)
+#    모델의 클래스 목록을 모를 때: 아래 PRINT_CLASSES = True 로 설정하면
+#    추론 시 검출된 클래스명을 터미널에 출력해줌
+EXCLUDE_CLASSES = ['crosswalk']
+PRINT_CLASSES   = False   # True로 바꾸면 클래스명 확인 가능
+
 # 테스트용 기본 접지점 (--kx --ky 로 덮어씌울 수 있음)
 DEFAULT_KX = 450
 DEFAULT_KY = 480
@@ -43,6 +49,10 @@ def get_color(idx):
 
 # ── Step 1: seg 추론 ─────────────────────────────────────
 def run_segmentation(model, frame):
+    """
+    EXCLUDE_CLASSES에 포함된 클래스(예: crosswalk)는 마스크에서 제외.
+    반환: list of np.ndarray (bool, H×W)
+    """
     results = model.predict(
         frame,
         conf=CONF_THRESH,
@@ -55,8 +65,18 @@ def run_segmentation(model, frame):
     if res.masks is None:
         return []
 
+    if PRINT_CLASSES:
+        detected = [res.names[int(c)] for c in res.boxes.cls]
+        print(f"[클래스 확인] 검출된 클래스: {detected}")
+
     masks = []
-    for m in res.masks.data:
+    for i, m in enumerate(res.masks.data):
+        # 클래스 필터링
+        cls_id   = int(res.boxes.cls[i].item())
+        cls_name = res.names[cls_id]
+        if cls_name in EXCLUDE_CLASSES:
+            continue
+
         mask_np = m.cpu().numpy()
         mask_resized = cv2.resize(
             mask_np.astype(np.uint8),
@@ -90,32 +110,36 @@ def get_instance_half_width(contours, max_hw=MAX_HALF_WIDTH):
 
 
 # ── Step 4: instance 중심선 추출 (minAreaRect 장축) ──────
-def get_centerline(contour):
+def get_centerline(mask_bin):
     """
-    minAreaRect의 장축 방향으로 선분을 반환.
-    반환: (pt1, pt2) — 각각 (int, int) 튜플
+    마스크 내부 픽셀 전체로 PCA → 장축 방향 중심선 반환
+    mask_bin: uint8 H×W (0/255)
+    반환: (pt1, pt2) 또는 None
     """
-    rect = cv2.minAreaRect(contour)
-    _, (w, h), _ = rect
-    box = cv2.boxPoints(rect)  # 4개 꼭짓점, float
+    ys, xs = np.where(mask_bin > 0)
+    if len(xs) < 5:
+        return None
 
-    if w >= h:
-        # 가로가 긴 경우: 좌변 중점 ↔ 우변 중점
-        pt1 = ((box[0] + box[1]) / 2).astype(int)
-        pt2 = ((box[2] + box[3]) / 2).astype(int)
-    else:
-        # 세로가 긴 경우: 상변 중점 ↔ 하변 중점
-        pt1 = ((box[1] + box[2]) / 2).astype(int)
-        pt2 = ((box[3] + box[0]) / 2).astype(int)
+    pts = np.column_stack([xs, ys]).astype(np.float32)
+    mean, eigenvectors = cv2.PCACompute(pts, mean=None)
+    center  = mean[0]
+    axis    = eigenvectors[0]   # 장축
+    perp    = eigenvectors[1]   # 단축
+
+    projections = (pts - center) @ axis
+    span  = projections.max() - projections.min()
+    width = ((pts - center) @ perp).ptp()
+
+    if width == 0 or span / width < 2.0:
+        return None
+
+    pt1 = (center + axis * projections.min()).astype(int)
+    pt2 = (center + axis * projections.max()).astype(int)
 
     return tuple(pt1), tuple(pt2)
 
-
 # ── Step 5: 접지점 ↔ 중심선 거리 계산 ───────────────────
 def point_to_segment_dist(px, py, ax, ay, bx, by):
-    """
-    점 (px, py)와 선분 (ax,ay)-(bx,by) 사이의 최소 거리
-    """
     dx, dy = bx - ax, by - ay
     seg_len_sq = dx * dx + dy * dy
 
@@ -162,16 +186,13 @@ def draw_results(frame, lane_data, kx, ky, violation_results):
         violated   = vr["violated"]
         draw_color = (0, 0, 255) if violated else color
 
-        # ① 마스크 반투명 오버레이
         overlay = vis.copy()
         overlay[data["mask_bin"] > 0] = draw_color
         vis = cv2.addWeighted(vis, 0.6, overlay, 0.4, 0)
 
-        # ② 중심선
         pt1, pt2 = data["centerline"]
         cv2.line(vis, pt1, pt2, draw_color, 2)
 
-        # ③ 반폭 + 거리 텍스트
         tx, ty = pt1
         label = (f"hw={data['half_width']:.1f} "
                  f"d={vr['dist']:.1f} "
@@ -179,14 +200,12 @@ def draw_results(frame, lane_data, kx, ky, violation_results):
         cv2.putText(vis, label, (tx, ty - 8),
                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, draw_color, 1)
 
-    # ④ 접지점
     cv2.circle(vis, (kx, ky), 8, (0, 0, 255), -1)
     cv2.circle(vis, (kx, ky), 8, (255, 255, 255), 2)
     cv2.putText(vis, f"KP({kx},{ky})",
                 (kx + 10, ky - 8),
                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 1)
 
-    # ⑤ 최종 상태
     any_viol = any(vr["violated"] for vr in violation_results)
     status   = "VIOLATION" if any_viol else "NORMAL"
     s_color  = (0, 0, 255) if any_viol else (0, 255, 0)
@@ -200,24 +219,20 @@ def draw_results(frame, lane_data, kx, ky, violation_results):
 
 # ── 메인 파이프라인 ──────────────────────────────────────
 def process_frame(model, frame, kx, ky):
-    # Step 1
     instance_masks = run_segmentation(model, frame)
 
     lane_data = []
     for mask_bool in instance_masks:
         mask_bin = (mask_bool * 255).astype(np.uint8)
-
-        # Step 2
         contours = filter_small_contours(mask_bin)
         if not contours:
             continue
 
-        # Step 3
         half_width = get_instance_half_width(contours)
-
-        # Step 4: 가장 큰 조각으로 중심선 추출
         largest    = max(contours, key=cv2.contourArea)
-        centerline = get_centerline(largest)
+        centerline = get_centerline(mask_bin)
+        if centerline is None:   # 비율 불안정 → skip
+            continue
 
         lane_data.append({
             "mask_bin"  : mask_bin,
@@ -226,12 +241,8 @@ def process_frame(model, frame, kx, ky):
             "centerline": centerline,
         })
 
-    # Step 5
     compute_distances(lane_data, kx, ky)
-
-    # Step 6
     violation_results = check_violation(lane_data)
-
     vis = draw_results(frame, lane_data, kx, ky, violation_results)
     return vis, lane_data, violation_results
 
@@ -240,8 +251,8 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--img",   required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--kx",    type=int, default=DEFAULT_KX, help="접지점 x좌표")
-    parser.add_argument("--ky",    type=int, default=DEFAULT_KY, help="접지점 y좌표")
+    parser.add_argument("--kx",    type=int, default=DEFAULT_KX)
+    parser.add_argument("--ky",    type=int, default=DEFAULT_KY)
     parser.add_argument("--save",  default=None)
     args = parser.parse_args()
 
