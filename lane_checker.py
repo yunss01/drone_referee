@@ -83,6 +83,11 @@ def run_segmentation(model, frame):
             (frame.shape[1], frame.shape[0]),
             interpolation=cv2.INTER_NEAREST,
         ).astype(bool)
+        
+        # 마스크 경계에서 2px씩 깎아내는 침식 적용
+        kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5)) 
+        mask_resized = cv2.erode(mask_resized.astype(np.uint8), kernel).astype(bool)
+        
         masks.append(mask_resized)
     return masks
 
