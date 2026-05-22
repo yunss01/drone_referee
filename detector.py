@@ -5,7 +5,6 @@ from ultralytics.engine.results import Results
 # ──────────────────────────────────────────
 #  설정값
 # ──────────────────────────────────────────
-MODEL_PATH  = "best_referee.pt"  # 학습된 모델 경로
 DEVICE      = "cuda:0"           # 추론 장치 (GPU 없으면 "cpu")
 CONF_THRESH = 0.5                # 이 신뢰도 이상인 bbox만 사용
 KP_THRESH   = 0.7                # 이 신뢰도 이상인 keypoint만 유효로 판단
@@ -14,14 +13,15 @@ KP_THRESH   = 0.7                # 이 신뢰도 이상인 keypoint만 유효로
 
 class WheelDetector:
 
-    def __init__(self):
-        print(f"🔍 모델 로딩 중: {MODEL_PATH}")
+    def __init__(self, model_path: str = None):
+        print(f"🔍 모델 로딩 중: {model_path}")
+        if model_path is None:
+            raise ValueError("model_path를 반드시 지정해야 합니다.")
         try:
-            self.model = YOLO(MODEL_PATH, task="pose")
-            self.model.to(DEVICE)
+            self.model = YOLO(model_path, task="pose")
             print("✅ 모델 로딩 완료")
         except FileNotFoundError:
-            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {MODEL_PATH}")
+            raise FileNotFoundError(f"모델 파일을 찾을 수 없습니다: {model_path}")
         except Exception as e:
             raise RuntimeError(f"모델 로딩 실패: {e}")
 
@@ -98,3 +98,41 @@ class WheelDetector:
             })
 
         return detections
+
+if __name__ == "__main__":
+    import argparse, cv2
+
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--img",   required=True)
+    parser.add_argument("--model", required=True)
+    parser.add_argument("--save",  default=None)
+    args = parser.parse_args()
+
+    detector = WheelDetector(model_path=args.model)
+    frame    = cv2.imread(args.img)
+
+    wheels = detector.predict(frame)
+    vis    = frame.copy()
+
+    print(f"\n✅ 검출된 바퀴 수: {len(wheels)}")
+    for i, w in enumerate(wheels):
+        x1, y1, x2, y2 = w["bbox"]
+        kx, ky          = w["keypoint"]
+        kp_valid        = w["kp_valid"]
+
+        cv2.rectangle(vis, (x1, y1), (x2, y2), (0, 255, 0), 2)
+        cv2.circle(vis, (kx, ky), 6, (0, 0, 255), -1)
+        cv2.circle(vis, (kx, ky), 6, (255, 255, 255), 1)
+        label = f""
+        cv2.putText(vis, label, (x1, y1 - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        print(f"  바퀴 {i}: bbox=({x1},{y1},{x2},{y2})  "
+              f"접지점=({kx},{ky})  {'KP✅' if kp_valid else 'fallback⚠'}")
+
+    if args.save:
+        cv2.imwrite(args.save, vis)
+        print(f"💾 저장: {args.save}")
+    else:
+        cv2.imshow("Wheel Detector", vis)
+        cv2.waitKey(0)
+        cv2.destroyAllWindows()

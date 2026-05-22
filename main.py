@@ -37,16 +37,20 @@ MODE = 'video'
 # [camera 모드] 카메라 장치 번호 (ls /dev/video* 로 확인)
 CAM_NUM = 0
 
-VIDEO_INPUT  = "dataset/3배_1.MP4"
-VIDEO_OUTPUT = "result_video_1.mp4"
+VIDEO_INPUT  = "0035_D.mp4"
+VIDEO_OUTPUT = "0035_result_video_comp.mp4"
 
 IMAGE_INPUT  = "test.jpg"
 IMAGE_OUTPUT = "result_images/"
 
-SEG_MODEL_PATH  = "best_seg_rev02.pt"
-POSE_MODEL_PATH = "best_referee.pt"
+SEG_MODEL_PATH  = "model/best_seg_rev03_FP16.engine"
+POSE_MODEL_PATH = "model/best_referee_FP16.engine"
 MAX_WHEELS      = 4
 SHOW_WINDOW     = False
+
+# ── 프레임 스킵 설정 ──────────────────────────────────────
+# N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
+FRAME_SKIP = 3
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -90,10 +94,6 @@ def start_input_listener(state: RefereeState):
 
 # ── FPS 측정기 ───────────────────────────────────────────
 class FPSCounter:
-    """
-    최근 N개 프레임의 처리 시간을 기반으로 평균 FPS 계산.
-    매 print_interval 프레임마다 터미널에 출력.
-    """
     def __init__(self, window=30, print_interval=30):
         self.window         = window
         self.print_interval = print_interval
@@ -233,8 +233,8 @@ def process_frame(seg_model, wheel_det, trackers, frame, state: RefereeState):
 # ── 모델 / tracker 초기화 ────────────────────────────────
 def load_models():
     print("🔍 모델 로딩 중...")
-    seg_model = YOLO(SEG_MODEL_PATH)
-    wheel_det = WheelDetector()
+    seg_model = YOLO(SEG_MODEL_PATH, task='segment')
+    wheel_det = WheelDetector(model_path=POSE_MODEL_PATH)
     trackers  = [ViolationTracker(wheel_id=i) for i in range(MAX_WHEELS)]
     print("✅ 모델 로딩 완료\n")
     return seg_model, wheel_det, trackers
@@ -252,10 +252,12 @@ def run_camera(state):
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     print(f"🎥 카메라 모드 시작 (장치: /dev/video{CAM_NUM}, {w}×{h})")
+    print(f"   프레임 스킵: {FRAME_SKIP} (매 {FRAME_SKIP}번째 프레임만 추론)")
     print(f"   종료: 'q' 키\n")
 
-    clahe   = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
-    fps_ctr = FPSCounter(window=30, print_interval=30)
+    clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
+    fps_ctr   = FPSCounter(window=30, print_interval=30)
+    frame_idx = 0
 
     try:
         while True:
@@ -264,12 +266,18 @@ def run_camera(state):
                 print("⚠️  프레임 읽기 실패, 재시도 중...")
                 continue
 
+            # FRAME_SKIP마다 한 번만 추론
+            if frame_idx % FRAME_SKIP != 0:
+                frame_idx += 1
+                continue
+
             fps_ctr.tick()
             frame = _apply_clahe(frame, clahe)
             vis, _ = process_frame(seg_model, wheel_det, trackers, frame, state)
 
             if fps_ctr.should_print():
-                print(f"  [camera] {fps_ctr.fps():.1f} fps  "
+                print(f"  [camera] 추론 {fps_ctr.fps():.1f} fps  "
+                      f"(원본 환산: {fps_ctr.fps() * FRAME_SKIP:.1f} fps 상당)  "
                       f"(frame {fps_ctr.frame_count})")
 
             if SHOW_WINDOW:
@@ -277,13 +285,15 @@ def run_camera(state):
                 if cv2.waitKey(1) & 0xFF == ord('q'):
                     break
 
+            frame_idx += 1
+
     except KeyboardInterrupt:
         pass
     finally:
         cap.release()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
-        print(f"\n✅ 종료  |  평균 FPS: {fps_ctr.fps():.1f}")
+        print(f"\n✅ 종료  |  추론 평균 FPS: {fps_ctr.fps():.1f}")
 
 
 # ── video 모드 ────────────────────────────────────────────
@@ -299,9 +309,12 @@ def run_video(state):
     h     = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps   = cap.get(cv2.CAP_PROP_FPS)
     total = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    out   = cv2.VideoWriter(VIDEO_OUTPUT,
-                            cv2.VideoWriter_fourcc(*'mp4v'),
-                            fps, (w, h))
+
+    # out_fps = fps / FRAME_SKIP # 원본과 같은 시간 길이로 재생
+    out_fps = fps / FRAME_SKIP # 원본과 같은 속도로 재생 (30fps 유지)
+    out = cv2.VideoWriter(VIDEO_OUTPUT,
+                          cv2.VideoWriter_fourcc(*'mp4v'),
+                          out_fps, (w, h))
 
     log_f = None
     if SAVE_LOG:
@@ -312,12 +325,21 @@ def run_video(state):
     clahe   = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
     fps_ctr = FPSCounter(window=30, print_interval=30)
     print(f"🎬 영상 모드: {VIDEO_INPUT} ({total}프레임, {fps:.1f}fps, {w}×{h})")
+    print(f"   프레임 스킵: {FRAME_SKIP} → 추론 {total//FRAME_SKIP}프레임, "
+          f"결과 영상 {out_fps:.1f}fps\n")
 
-    frame_idx = 0
+    frame_idx   = 0
+    infer_count = 0
+
     while cap.isOpened():
         ret, frame = cap.read()
         if not ret:
             break
+
+        # FRAME_SKIP마다 한 번만 추론
+        if frame_idx % FRAME_SKIP != 0:
+            frame_idx += 1
+            continue
 
         fps_ctr.tick()
         frame = _apply_clahe(frame, clahe)
@@ -332,12 +354,14 @@ def run_video(state):
                 if s["confirmed"]:
                     log_f.write(f"{frame_idx},{timestamp:.3f},{s['wheel_id']}\n")
 
-        frame_idx += 1
+        infer_count += 1
+        frame_idx   += 1
+
         if fps_ctr.should_print():
             progress = frame_idx / total * 100
             print(f"  [{frame_idx}/{total}] {progress:.1f}%  |  "
-                  f"처리 속도: {fps_ctr.fps():.1f} fps  "
-                  f"(원본: {fps:.1f} fps)")
+                  f"추론 속도: {fps_ctr.fps():.1f} fps  "
+                  f"(원본: {fps:.1f} fps, skip={FRAME_SKIP})")
 
         if SHOW_WINDOW:
             cv2.imshow("Drone Referee", vis)
@@ -352,7 +376,9 @@ def run_video(state):
         cv2.destroyAllWindows()
 
     print(f"\n✅ 완료 → {VIDEO_OUTPUT}")
-    print(f"   전체 평균 처리 속도: {fps_ctr.fps():.1f} fps  (원본: {fps:.1f} fps)")
+    print(f"   추론 프레임 수: {infer_count} / {total}")
+    print(f"   추론 평균 속도: {fps_ctr.fps():.1f} fps")
+    print(f"   결과 영상 fps:  {out_fps:.1f} fps")
     if SAVE_LOG:
         print(f"   로그 → {VIOLATION_LOG}")
 

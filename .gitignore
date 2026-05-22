@@ -25,3 +25,10 @@ segmentation\ DL\ model/drone_Referee_line_seg.v1i.yolov8/
 result*.jpg
 *.pkl
 dataset/
+test_results/
+*.onnx
+*.engine
+segmentation DL model/line_seg/
+*.engine
+*.onnx
+segmentation DL model/line_seg/

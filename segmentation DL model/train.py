@@ -3,11 +3,11 @@ from ultralytics import YOLO
 
 def main():
     # 데이터셋 경로 (Roboflow에서 받은 데이터셋으로 변경)
-    data_path = "/home/sukja/drone_Referee/segmentation DL model/drone_Referee_line_seg.v2i.yolov11/data.yaml"
+    data_path = "/home/sukja/drone_Referee/segmentation DL model/drone_Referee_line_seg.v3i.yolov8/data.yaml"
 
     print("🚀 차선 segmentation 모델 학습을 시작합니다!")
     
-    model = YOLO("yolo11m-seg.pt")
+    model = YOLO("yolov8m-seg.pt")
 
     results = model.train(
         data=data_path,
@@ -19,7 +19,7 @@ def main():
         batch=4,
         
         patience=50,
-        imgsz=1280,
+        imgsz=960,
         device=0,
         
         # --- 🚨 이전 train.py와 핵심 차이점: bbox도 중요 ---
@@ -31,7 +31,7 @@ def main():
         # --- Data Augmentation ---
         # Roboflow에서 이미 적용: noise, blur
         # 여기서는 Roboflow가 안 해주는 것만 적용
-        degrees=30.0,       # 드론 시점 회전 (360은 과함, 30 정도가 현실적)
+        degrees=0.0,       # 드론 시점 회전 (roboflow에서 이미 적용 했음)
         perspective=0.0003, # 원근 변환 (드론 각도 변화 시뮬레이션)
         translate=0.1,      # 이동
         scale=0.5,          # 드론 고도 변화 시뮬레이션
@@ -40,7 +40,7 @@ def main():
         mosaic=1.0,         # 여러 이미지 합성 (기본값, 소량 데이터에 효과적)
         
         project="line_seg",
-        name="rev03",
+        name="rev05",
         save=True
     )
 

@@ -19,7 +19,7 @@ from ultralytics import YOLO
 #  설정값
 # ──────────────────────────────────────────────────────────
 CONF_THRESH    = 0.5    # seg 모델 신뢰도 임계값
-IMGSZ          = 1280   # 추론 해상도
+IMGSZ          = 1280   # 추론 해상도 1280->960으로 다운
 
 MIN_AREA       = 200    # 이보다 작은 마스크 조각은 노이즈로 제거 (px²)
 MAX_HALF_WIDTH = 50     # 반폭 상한 클리핑 (px)
@@ -256,36 +256,49 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--img",   required=True)
     parser.add_argument("--model", required=True)
-    parser.add_argument("--kx",    type=int, default=DEFAULT_KX)
-    parser.add_argument("--ky",    type=int, default=DEFAULT_KY)
     parser.add_argument("--save",  default=None)
     args = parser.parse_args()
 
-    model = YOLO(args.model)
+    model = YOLO(args.model, task='segment')
     frame = cv2.imread(args.img)
     if frame is None:
         print(f"❌ 이미지를 읽을 수 없습니다: {args.img}")
         return
 
-    vis, lane_data, violation_results = process_frame(
-        model, frame, args.kx, args.ky
-    )
+    instance_masks = run_segmentation(model, frame)
+    vis = frame.copy()
 
-    print(f"\n✅ 검출된 차선 수: {len(lane_data)}")
-    for vr in violation_results:
-        status = "⚠ 침범" if vr["violated"] else "정상"
-        print(f"  차선 {vr['lane_idx']}: "
-              f"거리={vr['dist']:.1f}px | "
-              f"반폭={vr['half_width']:.1f}px | {status}")
+    lane_count = 0
+    for mask_bool in instance_masks:
+        mask_bin = (mask_bool * 255).astype(np.uint8)
+        contours = filter_small_contours(mask_bin)
+        if not contours:
+            continue
 
-    any_viol = any(vr["violated"] for vr in violation_results)
-    print(f"\n최종 판정: {'⚠ 침범' if any_viol else '✅ 정상'}")
+        centerline = get_centerline(mask_bin)
+        if centerline is None:
+            continue
+
+        # 노란색 마스크 오버레이
+        overlay = vis.copy()
+        overlay[mask_bin > 0] = (0, 215, 255)
+        vis = cv2.addWeighted(vis, 0.6, overlay, 0.4, 0)
+
+        # 중심선
+        pt1, pt2 = centerline
+        cv2.line(vis, pt1, pt2, (0, 215, 255), 2)
+        lane_count += 1
+
+    cv2.putText(vis, f"lanes: {lane_count}", (10, 40),
+                cv2.FONT_HERSHEY_SIMPLEX, 1.0, (255, 255, 255), 2)
+
+    print(f"✅ 검출된 차선 수: {lane_count}")
 
     if args.save:
         cv2.imwrite(args.save, vis)
         print(f"💾 저장: {args.save}")
     else:
-        cv2.imshow("Lane Checker - Step 1~5", vis)
+        cv2.imshow("Lane Checker", vis)
         cv2.waitKey(0)
         cv2.destroyAllWindows()
 

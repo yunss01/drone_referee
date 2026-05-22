@@ -2,7 +2,7 @@ import cv2
 import numpy as np
 import os
 
-def apply_clahe_to_image(image_path, clip_limit=3.0, grid_size=(8, 8)):
+def apply_clahe_to_image(image_path, clip_limit=2.0, grid_size=(4, 4)):
     # 1. 이미지 로드
     img = cv2.imread(image_path)
     if img is None:
@@ -27,7 +27,7 @@ def apply_clahe_to_image(image_path, clip_limit=3.0, grid_size=(8, 8)):
     return enhanced_img
 
 # --- 실행 부분 ---
-image_files = ['1.jpeg', '2.png'] # 테스트할 이미지 파일명 2개
+image_files = ['test_image.png'] # 테스트할 이미지 파일명
 output_folder = './clahe_results'
 
 if not os.path.exists(output_folder):
