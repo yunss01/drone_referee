@@ -17,6 +17,7 @@ import os
 import cv2
 import time
 import threading
+import subprocess
 import numpy as np
 from ultralytics import YOLO
 
@@ -32,10 +33,14 @@ from violation_tracker import ViolationTracker
 # ──────────────────────────────────────────────────────────
 #  모드 설정
 # ──────────────────────────────────────────────────────────
-MODE = 'video'
+MODE = 'camera'  # 'camera' / 'video' / 'image'
 
 # [camera 모드] 카메라 장치 번호 (ls /dev/video* 로 확인)
 CAM_NUM = 0
+CAMERA_OUTPUT = "camera_result_video.mp4"
+STREAM_ENABLED = False
+STREAM_RTMP_URL = "rtmps://a.rtmps.youtube.com/live2/YOUR_STREAM_KEY"
+STREAM_PRESET = "veryfast"
 
 VIDEO_INPUT  = "0035_D.mp4"
 VIDEO_OUTPUT = "0035_result_video_comp.mp4"
@@ -50,7 +55,7 @@ SHOW_WINDOW     = False
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
-FRAME_SKIP = 3
+FRAME_SKIP = 2
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -240,6 +245,68 @@ def load_models():
     return seg_model, wheel_det, trackers
 
 
+def start_stream_process(width, height, fps):
+    if not STREAM_ENABLED:
+        return None
+
+    if not STREAM_RTMP_URL or "YOUR_STREAM_KEY" in STREAM_RTMP_URL:
+        print("⚠️  STREAM_ENABLED=True 이지만 STREAM_RTMP_URL 설정이 비어 있습니다.")
+        print("   mp4 저장만 계속 진행합니다.")
+        return None
+
+    cmd = [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-y",
+        "-f", "rawvideo",
+        "-pix_fmt", "bgr24",
+        "-s", f"{width}x{height}",
+        "-r", f"{fps:.3f}",
+        "-i", "-",
+        "-an",
+        "-c:v", "libx264",
+        "-preset", STREAM_PRESET,
+        "-tune", "zerolatency",
+        "-pix_fmt", "yuv420p",
+        "-f", "flv",
+        STREAM_RTMP_URL,
+    ]
+
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("⚠️  ffmpeg를 찾을 수 없습니다. mp4 저장만 계속 진행합니다.")
+        return None
+    except Exception as e:
+        print(f"⚠️  라이브 송출 시작 실패: {e}")
+        print("   mp4 저장만 계속 진행합니다.")
+        return None
+
+    print(f"📡 라이브 송출 시작 → {STREAM_RTMP_URL}")
+    return proc
+
+
+def stop_stream_process(proc):
+    if proc is None:
+        return
+
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+
+    try:
+        proc.wait(timeout=5)
+    except Exception:
+        proc.kill()
+
+
 # ── camera 모드 ───────────────────────────────────────────
 def run_camera(state):
     seg_model, wheel_det, trackers = load_models()
@@ -251,13 +318,38 @@ def run_camera(state):
 
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    cam_fps = cap.get(cv2.CAP_PROP_FPS)
+    if not cam_fps or np.isnan(cam_fps) or cam_fps <= 0:
+        cam_fps = 30.0
+
+    out_fps = cam_fps / FRAME_SKIP
+    out_dir = os.path.dirname(CAMERA_OUTPUT)
+    if out_dir:
+        os.makedirs(out_dir, exist_ok=True)
+
+    out = cv2.VideoWriter(
+        CAMERA_OUTPUT,
+        cv2.VideoWriter_fourcc(*'mp4v'),
+        out_fps,
+        (w, h)
+    )
+    if not out.isOpened():
+        cap.release()
+        print(f"❌ 결과 영상 저장 파일을 열 수 없습니다: {CAMERA_OUTPUT}")
+        return
+
+    stream_proc = start_stream_process(w, h, out_fps)
+
     print(f"🎥 카메라 모드 시작 (장치: /dev/video{CAM_NUM}, {w}×{h})")
     print(f"   프레임 스킵: {FRAME_SKIP} (매 {FRAME_SKIP}번째 프레임만 추론)")
+    print(f"   결과 저장: {CAMERA_OUTPUT} ({out_fps:.1f}fps)")
+    print(f"   라이브 송출: {'ON' if stream_proc else 'OFF'}")
     print(f"   종료: 'q' 키\n")
 
     clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
     fps_ctr   = FPSCounter(window=30, print_interval=30)
     frame_idx = 0
+    infer_count = 0
 
     try:
         while True:
@@ -274,6 +366,17 @@ def run_camera(state):
             fps_ctr.tick()
             frame = _apply_clahe(frame, clahe)
             vis, _ = process_frame(seg_model, wheel_det, trackers, frame, state)
+            out.write(vis)
+
+            if stream_proc is not None and stream_proc.stdin is not None:
+                try:
+                    stream_proc.stdin.write(vis.tobytes())
+                except (BrokenPipeError, OSError):
+                    print("⚠️  라이브 송출 연결이 끊겼습니다. mp4 저장만 계속 진행합니다.")
+                    stop_stream_process(stream_proc)
+                    stream_proc = None
+
+            infer_count += 1
 
             if fps_ctr.should_print():
                 print(f"  [camera] 추론 {fps_ctr.fps():.1f} fps  "
@@ -291,9 +394,14 @@ def run_camera(state):
         pass
     finally:
         cap.release()
+        out.release()
+        stop_stream_process(stream_proc)
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
-        print(f"\n✅ 종료  |  추론 평균 FPS: {fps_ctr.fps():.1f}")
+        print(f"\n✅ 종료 → {CAMERA_OUTPUT}")
+        print(f"   저장 프레임 수: {infer_count}")
+        print(f"   추론 평균 FPS: {fps_ctr.fps():.1f}")
+        print(f"   결과 영상 fps: {out_fps:.1f}")
 
 
 # ── video 모드 ────────────────────────────────────────────
