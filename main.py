@@ -38,8 +38,9 @@ MODE = 'rtmp'  # 'camera' / 'video' / 'image' / 'rtmp'
 # [camera 모드] 카메라 장치 번호 (ls /dev/video* 로 확인)
 CAM_NUM = 0
 CAMERA_OUTPUT = "camera_result_video.mp4"
-STREAM_ENABLED = False
-STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
+
+STREAM_ENABLED = True
+STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/9hdv-mff8-h2kv-uyhh-cv8u"
 STREAM_PRESET = "veryfast"
 
 VIDEO_INPUT  = "0035_D.mp4"
@@ -49,11 +50,12 @@ VIDEO_OUTPUT = "0035_result_video_comp.mp4"
 # RTMP_INPUT  : 유튜브 라이브 URL 또는 로컬 nginx 서버 URL
 #   유튜브 라이브: "https://youtube.com/live/영상ID"
 #                  → yt-dlp로 자동으로 스트림 URL 추출
-#   로컬 nginx:   "rtmp://localhost/live/stream"
-#                  → yt-dlp 없이 직접 연결
 # RTMP_OUTPUT : 처리 결과를 저장할 파일명 (None이면 저장 안 함)
 RTMP_INPUT  = "https://youtube.com/live/BuqthGz1-So?feature=share"
 RTMP_OUTPUT = "rtmp_result.mp4"
+
+# 유튜브 라이브 화면을 보면서 Enter를 누를 때의 지연 보정값(초)
+REPOSITION_TOGGLE_DELAY_SEC = 6.0
 
 IMAGE_INPUT  = "test.jpg"
 IMAGE_OUTPUT = "result_images/"
@@ -65,7 +67,7 @@ SHOW_WINDOW     = False
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
-FRAME_SKIP = 2
+FRAME_SKIP = 1
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -76,20 +78,50 @@ VIOLATION_LOG = "violation_log.csv"
 # ── 재위치 토글 상태 관리 ────────────────────────────────
 class RefereeState:
     def __init__(self):
-        self._lock   = threading.Lock()
-        self._paused = False
+        self._lock             = threading.Lock()
+        self._paused           = False
+        self._scheduled_paused = False
+        self._pending_toggles  = []
+
+    def _status_text(self, paused):
+        if paused:
+            return "⏸  재위치 모드 ON  (침범 판정 일시정지)"
+        return "▶  재위치 모드 OFF (침범 판정 재개)"
+
+    def _apply_pending_locked(self, now=None):
+        if now is None:
+            now = time.time()
+
+        while self._pending_toggles and self._pending_toggles[0][0] <= now:
+            _, paused = self._pending_toggles.pop(0)
+            self._paused = paused
+            print(f"\n[적용] {self._status_text(paused)}\n")
+
+        if not self._pending_toggles:
+            self._scheduled_paused = self._paused
 
     @property
     def paused(self):
         with self._lock:
+            self._apply_pending_locked()
             return self._paused
 
     def toggle(self):
         with self._lock:
-            self._paused = not self._paused
-        status = "⏸  재위치 모드 ON  (침범 판정 일시정지)" if self._paused \
-                 else "▶  재위치 모드 OFF (침범 판정 재개)"
-        print(f"\n[토글] {status}\n")
+            now = time.time()
+            self._apply_pending_locked(now)
+            self._scheduled_paused = not self._scheduled_paused
+
+            if REPOSITION_TOGGLE_DELAY_SEC <= 0:
+                self._paused = self._scheduled_paused
+                print(f"\n[토글] {self._status_text(self._paused)}\n")
+                return
+
+            effective_at = now + REPOSITION_TOGGLE_DELAY_SEC
+            self._pending_toggles.append((effective_at, self._scheduled_paused))
+
+        print(f"\n[예약] {self._status_text(self._scheduled_paused)}")
+        print(f"      {REPOSITION_TOGGLE_DELAY_SEC:.1f}초 뒤 적용 예정\n")
 
 
 def start_input_listener(state: RefereeState):
