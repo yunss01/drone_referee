@@ -33,17 +33,27 @@ from violation_tracker import ViolationTracker
 # ──────────────────────────────────────────────────────────
 #  모드 설정
 # ──────────────────────────────────────────────────────────
-MODE = 'camera'  # 'camera' / 'video' / 'image'
+MODE = 'rtmp'  # 'camera' / 'video' / 'image' / 'rtmp'
 
 # [camera 모드] 카메라 장치 번호 (ls /dev/video* 로 확인)
 CAM_NUM = 0
 CAMERA_OUTPUT = "camera_result_video.mp4"
 STREAM_ENABLED = False
-STREAM_RTMP_URL = "rtmps://a.rtmps.youtube.com/live2/YOUR_STREAM_KEY"
+STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/YOUR_STREAM_KEY"
 STREAM_PRESET = "veryfast"
 
 VIDEO_INPUT  = "0035_D.mp4"
 VIDEO_OUTPUT = "0035_result_video_comp.mp4"
+
+# ── RTMP 모드 설정 ────────────────────────────────────────
+# RTMP_INPUT  : 유튜브 라이브 URL 또는 로컬 nginx 서버 URL
+#   유튜브 라이브: "https://youtube.com/live/영상ID"
+#                  → yt-dlp로 자동으로 스트림 URL 추출
+#   로컬 nginx:   "rtmp://localhost/live/stream"
+#                  → yt-dlp 없이 직접 연결
+# RTMP_OUTPUT : 처리 결과를 저장할 파일명 (None이면 저장 안 함)
+RTMP_INPUT  = "https://youtube.com/live/BuqthGz1-So?feature=share"
+RTMP_OUTPUT = "rtmp_result.mp4"
 
 IMAGE_INPUT  = "test.jpg"
 IMAGE_OUTPUT = "result_images/"
@@ -541,6 +551,131 @@ def run_image(state):
     print(f"✅ 완료 → {out_dir}")
 
 
+# ── rtmp 모드 ─────────────────────────────────────────────
+def run_rtmp(state):
+    """
+    유튜브 라이브 또는 RTMP 스트림에서 프레임을 받아 추론 후 결과를 파일로 저장.
+
+    RTMP_INPUT 설정:
+      유튜브 라이브: "https://youtube.com/live/영상ID"
+                     yt-dlp로 자동으로 스트림 URL 추출
+                     유튜브 딜레이 30초~1분, 사후 분석 용도로 적합
+      로컬 nginx:   "rtmp://localhost/live/stream"
+                     직접 연결, 딜레이 1~3초
+    """
+    import subprocess
+
+    seg_model, wheel_det, trackers = load_models()
+
+    print(f"📡 스트림 모드: {RTMP_INPUT}")
+    print(f"   종료: Ctrl+C\n")
+
+    # 유튜브 URL이면 yt-dlp로 실제 스트림 URL 추출
+    if RTMP_INPUT.startswith("http"):
+        print("  🔍 yt-dlp로 스트림 URL 추출 중...")
+        result = subprocess.run(
+            ["yt-dlp", "-g", "-f", "b", RTMP_INPUT],
+            capture_output=True, text=True
+        )
+        stream_url = result.stdout.strip()
+        if not stream_url:
+            print(f"❌ 스트림 URL 추출 실패")
+            print(f"   오류: {result.stderr.strip()}")
+            print("   유튜브 라이브가 시작됐는지 확인하세요.")
+            return
+        print(f"  ✅ 스트림 URL 추출 완료\n")
+    else:
+        stream_url = RTMP_INPUT
+
+    # 스트림 연결 재시도
+    cap = None
+    for attempt in range(10):
+        cap = cv2.VideoCapture(stream_url)
+        if cap.isOpened():
+            break
+        print(f"  ⏳ 연결 실패, 재시도 중... ({attempt+1}/10)")
+        time.sleep(3)
+
+    if not cap or not cap.isOpened():
+        print(f"❌ 스트림에 연결할 수 없습니다.")
+        return
+
+    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    if fps <= 0:
+        fps = 30.0
+
+    print(f"✅ 스트림 연결 성공: {w}×{h} @ {fps:.1f}fps")
+    print(f"   프레임 스킵: {FRAME_SKIP}\n")
+
+    # 결과 영상 저장 설정
+    out = None
+    if RTMP_OUTPUT:
+        out_fps = fps / FRAME_SKIP
+        out = cv2.VideoWriter(
+            RTMP_OUTPUT,
+            cv2.VideoWriter_fourcc(*'mp4v'),
+            out_fps, (w, h)
+        )
+        print(f"💾 결과 저장 → {RTMP_OUTPUT} ({out_fps:.1f}fps)\n")
+
+    clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
+    fps_ctr   = FPSCounter(window=30, print_interval=30)
+    frame_idx = 0
+    fail_cnt  = 0
+
+    try:
+        while True:
+            ret, frame = cap.read()
+
+            if not ret:
+                fail_cnt += 1
+                if fail_cnt >= 30:
+                    print("⚠️  스트림이 종료되었거나 연결이 끊겼습니다.")
+                    break
+                time.sleep(0.1)
+                continue
+            fail_cnt = 0
+
+            if frame_idx % FRAME_SKIP != 0:
+                frame_idx += 1
+                continue
+
+            fps_ctr.tick()
+            frame = _apply_clahe(frame, clahe)
+            vis, tracker_states = process_frame(
+                seg_model, wheel_det, trackers, frame, state
+            )
+
+            if out:
+                out.write(vis)
+
+            frame_idx += 1
+
+            if fps_ctr.should_print():
+                print(f"  [rtmp] 추론 {fps_ctr.fps():.1f} fps  "
+                      f"(frame {fps_ctr.frame_count})")
+
+            if SHOW_WINDOW:
+                cv2.imshow("Drone Referee - RTMP", vis)
+                if cv2.waitKey(1) & 0xFF == ord('q'):
+                    break
+
+    except KeyboardInterrupt:
+        pass
+    finally:
+        cap.release()
+        if out:
+            out.release()
+        if SHOW_WINDOW:
+            cv2.destroyAllWindows()
+
+    print(f"\n✅ 종료  |  추론 평균 FPS: {fps_ctr.fps():.1f}")
+    if RTMP_OUTPUT:
+        print(f"   결과 저장 → {RTMP_OUTPUT}")
+
+
 # ── 진입점 ───────────────────────────────────────────────
 if __name__ == "__main__":
     state = RefereeState()
@@ -552,5 +687,7 @@ if __name__ == "__main__":
         run_video(state)
     elif MODE == 'image':
         run_image(state)
+    elif MODE == 'rtmp':
+        run_rtmp(state)
     else:
-        print(f"❌ 알 수 없는 MODE: '{MODE}' → 'camera' / 'video' / 'image'")
+        print(f"❌ 알 수 없는 MODE: '{MODE}' → 'camera' / 'video' / 'image' / 'rtmp'")
