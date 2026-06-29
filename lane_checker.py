@@ -21,8 +21,9 @@ from ultralytics import YOLO
 CONF_THRESH    = 0.5    # seg 모델 신뢰도 임계값
 IMGSZ          = 1280   # 추론 해상도 1280->960으로 다운
 
-MIN_AREA       = 200    # 이보다 작은 마스크 조각은 노이즈로 제거 (px²)
-MAX_HALF_WIDTH = 50     # 반폭 상한 클리핑 (px)
+MIN_AREA             = 50    # 이보다 작은 마스크 조각은 노이즈로 제거 (px²)
+MAX_HALF_WIDTH       = 50    # 반폭 상한 클리핑 (px)
+CENTERLINE_MIN_ASPECT = 0.0  # 0 이하이면 span/width 비율 필터 비활성화
 
 # ① 결과에서 제외할 클래스명 (모델의 class 이름과 정확히 일치해야 함)
 #    모델의 클래스 목록을 모를 때: 아래 PRINT_CLASSES = True 로 설정하면
@@ -115,7 +116,7 @@ def get_instance_half_width(contours, max_hw=MAX_HALF_WIDTH):
 
 
 # ── Step 4: instance 중심선 추출 (minAreaRect 장축) ──────
-def get_centerline(mask_bin):
+def get_centerline(mask_bin, min_aspect=CENTERLINE_MIN_ASPECT):
     """
     마스크 내부 픽셀 전체로 PCA → 장축 방향 중심선 반환
     mask_bin: uint8 H×W (0/255)
@@ -135,7 +136,10 @@ def get_centerline(mask_bin):
     span  = projections.max() - projections.min()
     width = ((pts - center) @ perp).ptp()
 
-    if width == 0 or span / width < 2.0:
+    if width == 0:
+        return None
+
+    if min_aspect > 0 and span / width < min_aspect:
         return None
 
     pt1 = (center + axis * projections.min()).astype(int)

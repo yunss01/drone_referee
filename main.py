@@ -2,15 +2,15 @@
 main.py  —  드론 심판 시스템 통합 실행
 
 MODE 설정:
-  'camera' : USB 카메라 실시간
   'video'  : 영상 파일 처리 후 결과 영상 저장
   'image'  : 이미지 1장 또는 폴더 전체 처리 후 저장
+  'rtmp'   : 유튜브 라이브/RTMP 입력 → 추론 → 유튜브 RTMP 재송출
 
 재위치 토글:
   터미널에서 Enter 키 → 재위치 모드 ON/OFF
   재위치 모드 ON 중에는 침범 판정이 일시정지됨
 
-종료: 'q' 키 (camera/video 모드)
+종료: 'q' 키 (video 모드)
 """
 
 import os
@@ -18,6 +18,7 @@ import cv2
 import time
 import threading
 import subprocess
+import shutil
 import numpy as np
 from ultralytics import YOLO
 
@@ -33,26 +34,25 @@ from violation_tracker import ViolationTracker
 # ──────────────────────────────────────────────────────────
 #  모드 설정
 # ──────────────────────────────────────────────────────────
-MODE = 'rtmp'  # 'camera' / 'video' / 'image' / 'rtmp'
-
-# [camera 모드] 카메라 장치 번호 (ls /dev/video* 로 확인)
-CAM_NUM = 0
-CAMERA_OUTPUT = "camera_result_video.mp4"
-
-STREAM_ENABLED = True
-STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/9hdv-mff8-h2kv-uyhh-cv8u"
-STREAM_PRESET = "veryfast"
+MODE = 'rtmp'  # 'video' / 'image' / 'rtmp'
 
 VIDEO_INPUT  = "0035_D.mp4"
 VIDEO_OUTPUT = "0035_result_video_comp.mp4"
 
-# ── RTMP 모드 설정 ────────────────────────────────────────
-# RTMP_INPUT  : 유튜브 라이브 URL 또는 로컬 nginx 서버 URL
-#   유튜브 라이브: "https://youtube.com/live/영상ID"
-#                  → yt-dlp로 자동으로 스트림 URL 추출
-# RTMP_OUTPUT : 처리 결과를 저장할 파일명 (None이면 저장 안 함)
-RTMP_INPUT  = "https://youtube.com/live/BuqthGz1-So?feature=share"
-RTMP_OUTPUT = "rtmp_result.mp4"
+# ── 라이브 스트림 모드 설정 ───────────────────────────────
+# INPUT_STREAM_URL        : 유튜브 라이브 페이지 또는 직접 스트림 URL
+# INPUT_STREAM_FORMAT     : yt-dlp 입력 포맷 우선순위
+# OUTPUT_STREAM_ENABLED   : 처리 결과를 유튜브 RTMP로 재송출할지 여부
+# OUTPUT_STREAM_RTMP_URL  : 유튜브 라이브 송출 주소
+# SAVE_STREAM_OUTPUT      : 추론된 결과 영상을 로컬 mp4로 저장할지 여부
+# STREAM_OUTPUT_PATH      : 로컬 저장 파일 경로
+INPUT_STREAM_URL       = "https://youtube.com/live/--fQWyY7W-k"
+INPUT_STREAM_FORMAT    = "bestvideo[height<=720]/best[height<=720]/bestvideo/best"
+OUTPUT_STREAM_ENABLED  = True
+OUTPUT_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fsj7"
+OUTPUT_STREAM_PRESET   = "veryfast"
+SAVE_STREAM_OUTPUT     = True
+STREAM_OUTPUT_PATH     = "rtmp_result.mp4"
 
 # 유튜브 라이브 화면을 보면서 Enter를 누를 때의 지연 보정값(초)
 REPOSITION_TOGGLE_DELAY_SEC = 6.0
@@ -68,6 +68,7 @@ SHOW_WINDOW     = False
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
 FRAME_SKIP = 1
+STREAM_READ_TIMEOUT_SEC = 2.0
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -166,6 +167,145 @@ class FPSCounter:
         return self.frame_count % self.print_interval == 0
 
 
+class LatestFrameReader:
+    def __init__(self, cap):
+        self.cap = cap
+        self._cond = threading.Condition()
+        self._stop = False
+        self._frame = None
+        self._frame_id = 0
+        self._fail_count = 0
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while True:
+            with self._cond:
+                if self._stop:
+                    return
+
+            ret, frame = self.cap.read()
+
+            with self._cond:
+                if self._stop:
+                    return
+
+                if ret and frame is not None:
+                    self._frame = frame
+                    self._frame_id += 1
+                    self._fail_count = 0
+                else:
+                    self._fail_count += 1
+                self._cond.notify_all()
+
+            if not ret:
+                time.sleep(0.01)
+
+    def read_latest(self, last_frame_id, timeout_sec=1.0):
+        deadline = time.time() + timeout_sec
+        with self._cond:
+            while (
+                not self._stop
+                and self._frame_id <= last_frame_id
+                and self._fail_count == 0
+            ):
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+
+            if self._frame_id > last_frame_id and self._frame is not None:
+                return self._frame_id, self._frame.copy(), self._fail_count
+
+            return last_frame_id, None, self._fail_count
+
+    def stop(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+
+class RealtimeOutputWriter:
+    def __init__(self, fps, saved_out=None, stream_proc=None, stream_status="disabled"):
+        self.interval = 1.0 / fps if fps and fps > 0 else 1.0 / 30.0
+        self.saved_out = saved_out
+        self.stream_proc = stream_proc
+        self.stream_status = stream_status
+        self.output_frame_count = 0
+
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._stop = False
+        self._frame = None
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def update_frame(self, frame):
+        with self._cond:
+            self._frame = frame.copy()
+            self._cond.notify_all()
+
+    def _run(self):
+        with self._cond:
+            while self._frame is None and not self._stop:
+                self._cond.wait(timeout=0.1)
+
+        next_tick = time.perf_counter()
+        while True:
+            with self._cond:
+                if self._stop:
+                    return
+                frame = self._frame
+                stream_proc = self.stream_proc
+
+            if frame is not None:
+                if self.saved_out is not None:
+                    self.saved_out.write(frame)
+
+                if stream_proc is not None and stream_proc.stdin is not None:
+                    try:
+                        stream_proc.stdin.write(frame.tobytes())
+                    except (BrokenPipeError, OSError):
+                        print("⚠️  유튜브 송출 연결이 끊겼습니다. 로컬 저장만 계속 진행합니다.")
+                        stop_stream_process(stream_proc)
+                        with self._cond:
+                            if self.stream_proc is stream_proc:
+                                self.stream_proc = None
+                                self.stream_status = "disconnected"
+
+                self.output_frame_count += 1
+
+            next_tick += self.interval
+            delay = next_tick - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tick = time.perf_counter()
+
+    def stop(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+        if self.stream_proc is not None:
+            stop_stream_process(self.stream_proc)
+            self.stream_proc = None
+
+
 # ── 차선 데이터 구성 (Step 1~4) ──────────────────────────
 def build_lane_data(seg_model, frame):
     instance_masks = run_segmentation(seg_model, frame)
@@ -192,6 +332,29 @@ def build_lane_data(seg_model, frame):
     return lane_data
 
 
+def draw_dashed_line(vis, pt1, pt2, color, thickness=2, dash_len=18, gap_len=10):
+    start = np.array(pt1, dtype=np.float32)
+    end   = np.array(pt2, dtype=np.float32)
+    delta = end - start
+    length = float(np.linalg.norm(delta))
+    if length < 1.0:
+        return
+
+    direction = delta / length
+    pos = 0.0
+    while pos < length:
+        dash_start = start + direction * pos
+        dash_end   = start + direction * min(pos + dash_len, length)
+        cv2.line(
+            vis,
+            tuple(np.round(dash_start).astype(int)),
+            tuple(np.round(dash_end).astype(int)),
+            color,
+            thickness,
+        )
+        pos += dash_len + gap_len
+
+
 # ── 시각화 ───────────────────────────────────────────────
 def draw_frame(frame, lane_data, wheels, tracker_states, paused):
     vis = frame.copy()
@@ -200,9 +363,11 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
         color = (0, 200, 255)
         overlay = vis.copy()
         overlay[data["mask_bin"] > 0] = color
-        vis = cv2.addWeighted(vis, 0.6, overlay, 0.4, 0)
+        vis = cv2.addWeighted(vis, 0.72, overlay, 0.28, 0)
+        cv2.drawContours(vis, data["contours"], -1, (255, 255, 255), 1)
         pt1, pt2 = data["centerline"]
-        cv2.line(vis, pt1, pt2, color, 2)
+        draw_dashed_line(vis, pt1, pt2, (255, 255, 255), thickness=4)
+        draw_dashed_line(vis, pt1, pt2, color, thickness=2)
 
     any_confirmed = False
     for wheel, state in zip(wheels, tracker_states):
@@ -287,14 +452,102 @@ def load_models():
     return seg_model, wheel_det, trackers
 
 
-def start_stream_process(width, height, fps):
-    if not STREAM_ENABLED:
+def resolve_stream_url(input_url):
+    if not input_url:
+        print("❌ INPUT_STREAM_URL 설정이 비어 있습니다.")
         return None
 
-    if not STREAM_RTMP_URL or "YOUR_STREAM_KEY" in STREAM_RTMP_URL:
-        print("⚠️  STREAM_ENABLED=True 이지만 STREAM_RTMP_URL 설정이 비어 있습니다.")
-        print("   mp4 저장만 계속 진행합니다.")
+    if not input_url.startswith("http"):
+        return input_url
+
+    if "youtube.com" not in input_url and "youtu.be" not in input_url:
+        return input_url
+
+    print("  🔍 yt-dlp로 유튜브 스트림 URL 추출 중...")
+
+    commands = []
+    yt_dlp_bin = shutil.which("yt-dlp")
+    if yt_dlp_bin:
+        commands.append([yt_dlp_bin, "-g", "-f", INPUT_STREAM_FORMAT, input_url])
+    commands.append([
+        "python3", "-m", "yt_dlp", "-g", "-f", INPUT_STREAM_FORMAT, input_url
+    ])
+
+    last_error = None
+    for cmd in commands:
+        try:
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=False,
+            )
+        except FileNotFoundError:
+            continue
+
+        stream_urls = [
+            line.strip() for line in result.stdout.splitlines() if line.strip()
+        ]
+        if result.returncode == 0 and stream_urls:
+            print("  ✅ 스트림 URL 추출 완료\n")
+            return stream_urls[0]
+
+        stderr = result.stderr.strip() or "(stderr 없음)"
+        last_error = f"{' '.join(cmd[:3])}: {stderr}"
+
+    print("❌ 유튜브 스트림 URL 추출 실패")
+    if yt_dlp_bin is None:
+        print("   원인: yt-dlp가 설치되어 있지 않습니다.")
+        print("   설치: `sudo apt install yt-dlp` 또는 `python3 -m pip install yt-dlp`")
+    if last_error:
+        print(f"   오류: {last_error}")
+    return None
+
+
+def open_stream_capture(stream_url, retries=10, retry_delay=3.0):
+    cap = None
+    for attempt in range(1, retries + 1):
+        if cap is not None:
+            cap.release()
+
+        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
+        if cap.isOpened():
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            return cap
+        cap.release()
+
+        cap = cv2.VideoCapture(stream_url)
+        if cap.isOpened():
+            try:
+                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
+            except Exception:
+                pass
+            return cap
+        cap.release()
+
+        print(f"  ⏳ 입력 스트림 연결 실패, 재시도 중... ({attempt}/{retries})")
+        time.sleep(retry_delay)
+
+    return None
+
+
+def start_output_stream_process(width, height, fps):
+    if not OUTPUT_STREAM_ENABLED:
         return None
+
+    if (
+        not OUTPUT_STREAM_RTMP_URL
+        or "YOUR_STREAM_KEY" in OUTPUT_STREAM_RTMP_URL
+    ):
+        print("⚠️  OUTPUT_STREAM_ENABLED=True 이지만 OUTPUT_STREAM_RTMP_URL 설정이 비어 있습니다.")
+        print("   로컬 저장만 계속 진행합니다.")
+        return None
+
+    # YouTube 권장에 맞춰 2초 간격으로 키프레임을 고정한다.
+    gop_size = max(1, int(round(fps * 2)))
 
     cmd = [
         "ffmpeg",
@@ -305,13 +558,23 @@ def start_stream_process(width, height, fps):
         "-s", f"{width}x{height}",
         "-r", f"{fps:.3f}",
         "-i", "-",
-        "-an",
+        "-f", "lavfi",
+        "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
+        "-map", "0:v:0",
+        "-map", "1:a:0",
         "-c:v", "libx264",
-        "-preset", STREAM_PRESET,
+        "-preset", OUTPUT_STREAM_PRESET,
         "-tune", "zerolatency",
+        "-g", str(gop_size),
+        "-keyint_min", str(gop_size),
+        "-sc_threshold", "0",
         "-pix_fmt", "yuv420p",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-ar", "44100",
+        "-shortest",
         "-f", "flv",
-        STREAM_RTMP_URL,
+        OUTPUT_STREAM_RTMP_URL,
     ]
 
     try:
@@ -322,14 +585,15 @@ def start_stream_process(width, height, fps):
             stderr=subprocess.DEVNULL,
         )
     except FileNotFoundError:
-        print("⚠️  ffmpeg를 찾을 수 없습니다. mp4 저장만 계속 진행합니다.")
+        print("⚠️  ffmpeg를 찾을 수 없습니다. 로컬 저장만 계속 진행합니다.")
         return None
     except Exception as e:
         print(f"⚠️  라이브 송출 시작 실패: {e}")
-        print("   mp4 저장만 계속 진행합니다.")
+        print("   로컬 저장만 계속 진행합니다.")
         return None
 
-    print(f"📡 라이브 송출 시작 → {STREAM_RTMP_URL}")
+    print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL}")
+    print(f"   키프레임 간격: 약 {gop_size / fps:.1f}초 ({gop_size} 프레임)")
     return proc
 
 
@@ -347,104 +611,6 @@ def stop_stream_process(proc):
         proc.wait(timeout=5)
     except Exception:
         proc.kill()
-
-
-# ── camera 모드 ───────────────────────────────────────────
-def run_camera(state):
-    seg_model, wheel_det, trackers = load_models()
-
-    cap = cv2.VideoCapture(CAM_NUM)
-    if not cap.isOpened():
-        print(f"❌ 카메라 열기 실패: /dev/video{CAM_NUM}")
-        return
-
-    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    cam_fps = cap.get(cv2.CAP_PROP_FPS)
-    if not cam_fps or np.isnan(cam_fps) or cam_fps <= 0:
-        cam_fps = 30.0
-
-    out_fps = cam_fps / FRAME_SKIP
-    out_dir = os.path.dirname(CAMERA_OUTPUT)
-    if out_dir:
-        os.makedirs(out_dir, exist_ok=True)
-
-    out = cv2.VideoWriter(
-        CAMERA_OUTPUT,
-        cv2.VideoWriter_fourcc(*'mp4v'),
-        out_fps,
-        (w, h)
-    )
-    if not out.isOpened():
-        cap.release()
-        print(f"❌ 결과 영상 저장 파일을 열 수 없습니다: {CAMERA_OUTPUT}")
-        return
-
-    stream_proc = start_stream_process(w, h, out_fps)
-
-    print(f"🎥 카메라 모드 시작 (장치: /dev/video{CAM_NUM}, {w}×{h})")
-    print(f"   프레임 스킵: {FRAME_SKIP} (매 {FRAME_SKIP}번째 프레임만 추론)")
-    print(f"   결과 저장: {CAMERA_OUTPUT} ({out_fps:.1f}fps)")
-    print(f"   라이브 송출: {'ON' if stream_proc else 'OFF'}")
-    print(f"   종료: 'q' 키\n")
-
-    clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
-    fps_ctr   = FPSCounter(window=30, print_interval=30)
-    frame_idx = 0
-    infer_count = 0
-
-    try:
-        while True:
-            ret, frame = cap.read()
-            if not ret:
-                print("⚠️  프레임 읽기 실패, 재시도 중...")
-                continue
-
-            # FRAME_SKIP마다 한 번만 추론
-            if frame_idx % FRAME_SKIP != 0:
-                frame_idx += 1
-                continue
-
-            fps_ctr.tick()
-            frame = _apply_clahe(frame, clahe)
-            vis, _ = process_frame(seg_model, wheel_det, trackers, frame, state)
-            out.write(vis)
-
-            if stream_proc is not None and stream_proc.stdin is not None:
-                try:
-                    stream_proc.stdin.write(vis.tobytes())
-                except (BrokenPipeError, OSError):
-                    print("⚠️  라이브 송출 연결이 끊겼습니다. mp4 저장만 계속 진행합니다.")
-                    stop_stream_process(stream_proc)
-                    stream_proc = None
-
-            infer_count += 1
-
-            if fps_ctr.should_print():
-                print(f"  [camera] 추론 {fps_ctr.fps():.1f} fps  "
-                      f"(원본 환산: {fps_ctr.fps() * FRAME_SKIP:.1f} fps 상당)  "
-                      f"(frame {fps_ctr.frame_count})")
-
-            if SHOW_WINDOW:
-                cv2.imshow("Drone Referee", vis)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
-                    break
-
-            frame_idx += 1
-
-    except KeyboardInterrupt:
-        pass
-    finally:
-        cap.release()
-        out.release()
-        stop_stream_process(stream_proc)
-        if SHOW_WINDOW:
-            cv2.destroyAllWindows()
-        print(f"\n✅ 종료 → {CAMERA_OUTPUT}")
-        print(f"   저장 프레임 수: {infer_count}")
-        print(f"   추론 평균 FPS: {fps_ctr.fps():.1f}")
-        print(f"   결과 영상 fps: {out_fps:.1f}")
-
 
 # ── video 모드 ────────────────────────────────────────────
 def run_video(state):
@@ -586,88 +752,109 @@ def run_image(state):
 # ── rtmp 모드 ─────────────────────────────────────────────
 def run_rtmp(state):
     """
-    유튜브 라이브 또는 RTMP 스트림에서 프레임을 받아 추론 후 결과를 파일로 저장.
-
-    RTMP_INPUT 설정:
-      유튜브 라이브: "https://youtube.com/live/영상ID"
-                     yt-dlp로 자동으로 스트림 URL 추출
-                     유튜브 딜레이 30초~1분, 사후 분석 용도로 적합
-      로컬 nginx:   "rtmp://localhost/live/stream"
-                     직접 연결, 딜레이 1~3초
+    유튜브 라이브 또는 RTMP 스트림을 입력으로 받아 추론하고,
+    결과를 유튜브 RTMP로 재송출하거나 로컬 mp4로 저장한다.
     """
-    import subprocess
-
     seg_model, wheel_det, trackers = load_models()
 
-    print(f"📡 스트림 모드: {RTMP_INPUT}")
+    print(f"📡 스트림 모드 입력: {INPUT_STREAM_URL}")
     print(f"   종료: Ctrl+C\n")
 
-    # 유튜브 URL이면 yt-dlp로 실제 스트림 URL 추출
-    if RTMP_INPUT.startswith("http"):
-        print("  🔍 yt-dlp로 스트림 URL 추출 중...")
-        result = subprocess.run(
-            ["yt-dlp", "-g", "-f", "b", RTMP_INPUT],
-            capture_output=True, text=True
-        )
-        stream_url = result.stdout.strip()
-        if not stream_url:
-            print(f"❌ 스트림 URL 추출 실패")
-            print(f"   오류: {result.stderr.strip()}")
-            print("   유튜브 라이브가 시작됐는지 확인하세요.")
-            return
-        print(f"  ✅ 스트림 URL 추출 완료\n")
-    else:
-        stream_url = RTMP_INPUT
+    stream_url = resolve_stream_url(INPUT_STREAM_URL)
+    if not stream_url:
+        return
 
-    # 스트림 연결 재시도
-    cap = None
-    for attempt in range(10):
-        cap = cv2.VideoCapture(stream_url)
-        if cap.isOpened():
-            break
-        print(f"  ⏳ 연결 실패, 재시도 중... ({attempt+1}/10)")
-        time.sleep(3)
-
-    if not cap or not cap.isOpened():
+    cap = open_stream_capture(stream_url, retries=10, retry_delay=3.0)
+    if cap is None or not cap.isOpened():
         print(f"❌ 스트림에 연결할 수 없습니다.")
         return
 
     w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     fps = cap.get(cv2.CAP_PROP_FPS)
-    if fps <= 0:
+    if not fps or np.isnan(fps) or fps <= 0:
         fps = 30.0
+    output_fps = fps / FRAME_SKIP
+    output_size = (w, h)
 
     print(f"✅ 스트림 연결 성공: {w}×{h} @ {fps:.1f}fps")
     print(f"   프레임 스킵: {FRAME_SKIP}\n")
 
-    # 결과 영상 저장 설정
-    out = None
-    if RTMP_OUTPUT:
-        out_fps = fps / FRAME_SKIP
-        out = cv2.VideoWriter(
-            RTMP_OUTPUT,
+    saved_out = None
+    if SAVE_STREAM_OUTPUT:
+        out_dir = os.path.dirname(STREAM_OUTPUT_PATH)
+        if out_dir:
+            os.makedirs(out_dir, exist_ok=True)
+        saved_out = cv2.VideoWriter(
+            STREAM_OUTPUT_PATH,
             cv2.VideoWriter_fourcc(*'mp4v'),
-            out_fps, (w, h)
+            output_fps,
+            output_size,
         )
-        print(f"💾 결과 저장 → {RTMP_OUTPUT} ({out_fps:.1f}fps)\n")
+        if not saved_out.isOpened():
+            print(f"⚠️  결과 저장 파일을 열 수 없습니다: {STREAM_OUTPUT_PATH}")
+            saved_out.release()
+            saved_out = None
+
+    stream_proc = start_output_stream_process(w, h, output_fps)
+    if not OUTPUT_STREAM_ENABLED:
+        stream_status = "disabled"
+    elif stream_proc is None:
+        stream_status = "start_failed"
+    else:
+        stream_status = "streaming"
+
+    print(f"   로컬 저장: {'ON' if saved_out else 'OFF'}")
+    if SAVE_STREAM_OUTPUT:
+        print(f"   저장 경로: {STREAM_OUTPUT_PATH}")
+    print(f"   유튜브 송출: {'ON' if stream_proc else 'OFF'}")
+    print(f"   출력 FPS: {output_fps:.1f} (새 프레임이 늦으면 직전 프레임 유지)\n")
 
     clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
+    frame_reader = LatestFrameReader(cap).start()
+    output_writer = RealtimeOutputWriter(
+        output_fps,
+        saved_out=saved_out,
+        stream_proc=stream_proc,
+        stream_status=stream_status,
+    ).start()
     fps_ctr   = FPSCounter(window=30, print_interval=30)
+    last_frame_id = 0
     frame_idx = 0
     fail_cnt  = 0
+    infer_count = 0
 
     try:
         while True:
-            ret, frame = cap.read()
-
-            if not ret:
-                fail_cnt += 1
+            frame_id, frame, reader_fail_cnt = frame_reader.read_latest(
+                last_frame_id,
+                timeout_sec=STREAM_READ_TIMEOUT_SEC,
+            )
+            if frame is None:
+                fail_cnt = max(fail_cnt + 1, reader_fail_cnt)
                 if fail_cnt >= 30:
-                    print("⚠️  스트림이 종료되었거나 연결이 끊겼습니다.")
-                    break
-                time.sleep(0.1)
+                    print("⚠️  입력 스트림이 끊겨 재연결을 시도합니다.")
+                    frame_reader.stop()
+                    cap.release()
+                    cap = open_stream_capture(stream_url, retries=5, retry_delay=2.0)
+                    if cap is None or not cap.isOpened():
+                        print("❌ 입력 스트림 재연결 실패")
+                        break
+
+                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or w
+                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or h
+                    cap_fps = cap.get(cv2.CAP_PROP_FPS)
+                    if cap_fps and not np.isnan(cap_fps) and cap_fps > 0:
+                        fps = cap_fps
+                    frame_reader = LatestFrameReader(cap).start()
+                    last_frame_id = 0
+                    fail_cnt = 0
+                    print("✅ 입력 스트림 재연결 성공")
+                    continue
+                time.sleep(0.02)
                 continue
+
+            last_frame_id = frame_id
             fail_cnt = 0
 
             if frame_idx % FRAME_SKIP != 0:
@@ -676,18 +863,24 @@ def run_rtmp(state):
 
             fps_ctr.tick()
             frame = _apply_clahe(frame, clahe)
-            vis, tracker_states = process_frame(
+            vis, _ = process_frame(
                 seg_model, wheel_det, trackers, frame, state
             )
+            vis_for_output = vis
+            if (vis.shape[1], vis.shape[0]) != output_size:
+                vis_for_output = cv2.resize(vis, output_size)
 
-            if out:
-                out.write(vis)
+            output_writer.update_frame(vis_for_output)
 
             frame_idx += 1
+            infer_count += 1
 
             if fps_ctr.should_print():
-                print(f"  [rtmp] 추론 {fps_ctr.fps():.1f} fps  "
-                      f"(frame {fps_ctr.frame_count})")
+                print(
+                    f"  [rtmp] 추론 {fps_ctr.fps():.1f} fps  "
+                    f"(frame {fps_ctr.frame_count}, processed={infer_count}, "
+                    f"emitted={output_writer.output_frame_count}, source={w}x{h})"
+                )
 
             if SHOW_WINDOW:
                 cv2.imshow("Drone Referee - RTMP", vis)
@@ -697,15 +890,26 @@ def run_rtmp(state):
     except KeyboardInterrupt:
         pass
     finally:
+        frame_reader.stop()
         cap.release()
-        if out:
-            out.release()
+        output_writer.stop()
+        if saved_out:
+            saved_out.release()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
 
     print(f"\n✅ 종료  |  추론 평균 FPS: {fps_ctr.fps():.1f}")
-    if RTMP_OUTPUT:
-        print(f"   결과 저장 → {RTMP_OUTPUT}")
+    print(f"   처리 프레임 수: {infer_count}")
+    print(f"   출력 프레임 수: {output_writer.output_frame_count}")
+    if SAVE_STREAM_OUTPUT and saved_out is not None:
+        print(f"   결과 저장 → {STREAM_OUTPUT_PATH}")
+    stream_status_text = {
+        "disabled": "사용 안 함",
+        "start_failed": "시작 실패",
+        "streaming": "종료 시점까지 송출 유지",
+        "disconnected": "중간에 연결 끊김",
+    }[output_writer.stream_status]
+    print(f"   유튜브 송출 상태: {stream_status_text}")
 
 
 # ── 진입점 ───────────────────────────────────────────────
@@ -713,13 +917,11 @@ if __name__ == "__main__":
     state = RefereeState()
     start_input_listener(state)
 
-    if MODE == 'camera':
-        run_camera(state)
-    elif MODE == 'video':
+    if MODE == 'video':
         run_video(state)
     elif MODE == 'image':
         run_image(state)
     elif MODE == 'rtmp':
         run_rtmp(state)
     else:
-        print(f"❌ 알 수 없는 MODE: '{MODE}' → 'camera' / 'video' / 'image' / 'rtmp'")
+        print(f"❌ 알 수 없는 MODE: '{MODE}' → 'video' / 'image' / 'rtmp'")
