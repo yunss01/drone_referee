@@ -19,8 +19,19 @@ import time
 import threading
 import subprocess
 import shutil
+import sys
+import signal
+import atexit
+import traceback
+import faulthandler
+from collections import deque
 import numpy as np
 from ultralytics import YOLO
+
+try:
+    import resource
+except ImportError:
+    resource = None
 
 from preprocess import _apply_clahe, CLIP_LIMIT, TILE_SIZE
 from detector import WheelDetector
@@ -53,6 +64,7 @@ OUTPUT_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fs
 OUTPUT_STREAM_PRESET   = "veryfast"
 SAVE_STREAM_OUTPUT     = True
 STREAM_OUTPUT_PATH     = "rtmp_result.mp4"
+RUNTIME_LOG_PATH       = "logs/drone_referee_runtime.log"
 
 # 유튜브 라이브 화면을 보면서 Enter를 누를 때의 지연 보정값(초)
 REPOSITION_TOGGLE_DELAY_SEC = 6.0
@@ -64,6 +76,7 @@ SEG_MODEL_PATH  = "model/best_seg_rev03_FP16.engine"
 POSE_MODEL_PATH = "model/best_referee_FP16.engine"
 MAX_WHEELS      = 4
 SHOW_WINDOW     = False
+DRAW_LANE_VIS   = False
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
@@ -74,6 +87,115 @@ STREAM_READ_TIMEOUT_SEC = 2.0
 SAVE_LOG      = False
 VIOLATION_LOG = "violation_log.csv"
 # ──────────────────────────────────────────────────────────
+
+
+_RUNTIME_LOG_FILE = None
+_EXIT_RECORDED = False
+
+
+class TeeStream:
+    def __init__(self, console_stream, log_stream):
+        self.console_stream = console_stream
+        self.log_stream = log_stream
+        self._pending = ""
+
+    def write(self, data):
+        if not data:
+            return 0
+
+        self.console_stream.write(data)
+        self._pending += data
+
+        while "\n" in self._pending:
+            line, self._pending = self._pending.split("\n", 1)
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.log_stream.write(f"[{timestamp}] {line}\n")
+
+        return len(data)
+
+    def flush(self):
+        self.console_stream.flush()
+        if self._pending:
+            timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+            self.log_stream.write(f"[{timestamp}] {self._pending}")
+            self._pending = ""
+        self.log_stream.flush()
+
+    def isatty(self):
+        return self.console_stream.isatty()
+
+
+def get_memory_usage_mb():
+    if resource is None:
+        return None
+
+    usage_kb = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+    if sys.platform == "darwin":
+        return usage_kb / (1024 * 1024)
+    return usage_kb / 1024.0
+
+
+def record_exit(reason):
+    global _EXIT_RECORDED
+    if _EXIT_RECORDED:
+        return
+    _EXIT_RECORDED = True
+    print(f"\n[종료 기록] {reason}", flush=True)
+
+
+def setup_runtime_logging():
+    global _RUNTIME_LOG_FILE
+
+    os.makedirs(os.path.dirname(RUNTIME_LOG_PATH), exist_ok=True)
+    _RUNTIME_LOG_FILE = open(RUNTIME_LOG_PATH, "a", encoding="utf-8", buffering=1)
+
+    sys.stdout = TeeStream(sys.__stdout__, _RUNTIME_LOG_FILE)
+    sys.stderr = TeeStream(sys.__stderr__, _RUNTIME_LOG_FILE)
+
+    try:
+        faulthandler.enable(_RUNTIME_LOG_FILE, all_threads=True)
+    except Exception:
+        pass
+
+    def _handle_exception(exc_type, exc_value, exc_tb):
+        print("\n[치명적 예외] 프로그램이 예외로 종료됩니다.", flush=True)
+        traceback.print_exception(exc_type, exc_value, exc_tb)
+        record_exit(f"uncaught exception: {exc_type.__name__}")
+
+    sys.excepthook = _handle_exception
+
+    if hasattr(threading, "excepthook"):
+        def _handle_thread_exception(args):
+            print(f"\n[스레드 예외] thread={args.thread.name}", flush=True)
+            traceback.print_exception(
+                args.exc_type,
+                args.exc_value,
+                args.exc_traceback,
+            )
+        threading.excepthook = _handle_thread_exception
+
+    def _handle_signal(signum, _frame):
+        try:
+            signame = signal.Signals(signum).name
+        except ValueError:
+            signame = f"SIG{signum}"
+        print(f"\n[시그널] {signame}({signum}) 수신", flush=True)
+        record_exit(f"signal {signame}({signum})")
+        raise SystemExit(128 + signum)
+
+    for signame in ("SIGTERM", "SIGINT", "SIGHUP", "SIGABRT"):
+        if hasattr(signal, signame):
+            signal.signal(getattr(signal, signame), _handle_signal)
+
+    def _on_exit():
+        if not _EXIT_RECORDED:
+            record_exit("normal interpreter shutdown")
+        if _RUNTIME_LOG_FILE is not None:
+            _RUNTIME_LOG_FILE.flush()
+
+    atexit.register(_on_exit)
+
+    print(f"📝 런타임 로그 파일: {RUNTIME_LOG_PATH}", flush=True)
 
 
 # ── 재위치 토글 상태 관리 ────────────────────────────────
@@ -243,7 +365,8 @@ class RealtimeOutputWriter:
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._stop = False
-        self._frame = None
+        self._queue = deque()
+        self._last_frame = None
         self._thread = None
 
     def start(self):
@@ -251,14 +374,14 @@ class RealtimeOutputWriter:
         self._thread.start()
         return self
 
-    def update_frame(self, frame):
+    def submit_frame(self, frame, repeat_count=1):
         with self._cond:
-            self._frame = frame.copy()
+            self._queue.append([frame.copy(), max(1, int(repeat_count))])
             self._cond.notify_all()
 
     def _run(self):
         with self._cond:
-            while self._frame is None and not self._stop:
+            while not self._queue and not self._stop:
                 self._cond.wait(timeout=0.1)
 
         next_tick = time.perf_counter()
@@ -266,7 +389,14 @@ class RealtimeOutputWriter:
             with self._cond:
                 if self._stop:
                     return
-                frame = self._frame
+                if self._queue:
+                    frame, repeats_left = self._queue[0]
+                    self._last_frame = frame
+                    self._queue[0][1] -= 1
+                    if self._queue[0][1] <= 0:
+                        self._queue.popleft()
+                else:
+                    frame = self._last_frame
                 stream_proc = self.stream_proc
 
             if frame is not None:
@@ -304,6 +434,10 @@ class RealtimeOutputWriter:
         if self.stream_proc is not None:
             stop_stream_process(self.stream_proc)
             self.stream_proc = None
+
+    def pending_frames(self):
+        with self._cond:
+            return len(self._queue)
 
 
 # ── 차선 데이터 구성 (Step 1~4) ──────────────────────────
@@ -359,15 +493,16 @@ def draw_dashed_line(vis, pt1, pt2, color, thickness=2, dash_len=18, gap_len=10)
 def draw_frame(frame, lane_data, wheels, tracker_states, paused):
     vis = frame.copy()
 
-    for data in lane_data:
-        color = (0, 200, 255)
-        overlay = vis.copy()
-        overlay[data["mask_bin"] > 0] = color
-        vis = cv2.addWeighted(vis, 0.72, overlay, 0.28, 0)
-        cv2.drawContours(vis, data["contours"], -1, (255, 255, 255), 1)
-        pt1, pt2 = data["centerline"]
-        draw_dashed_line(vis, pt1, pt2, (255, 255, 255), thickness=4)
-        draw_dashed_line(vis, pt1, pt2, color, thickness=2)
+    if DRAW_LANE_VIS:
+        for data in lane_data:
+            color = (0, 200, 255)
+            overlay = vis.copy()
+            overlay[data["mask_bin"] > 0] = color
+            vis = cv2.addWeighted(vis, 0.72, overlay, 0.28, 0)
+            cv2.drawContours(vis, data["contours"], -1, (255, 255, 255), 1)
+            pt1, pt2 = data["centerline"]
+            draw_dashed_line(vis, pt1, pt2, (255, 255, 255), thickness=4)
+            draw_dashed_line(vis, pt1, pt2, color, thickness=2)
 
     any_confirmed = False
     for wheel, state in zip(wheels, tracker_states):
@@ -450,6 +585,30 @@ def load_models():
     trackers  = [ViolationTracker(wheel_id=i) for i in range(MAX_WHEELS)]
     print("✅ 모델 로딩 완료\n")
     return seg_model, wheel_det, trackers
+
+
+def start_ffmpeg_log_thread(proc):
+    if proc.stderr is None:
+        return
+
+    def _drain():
+        try:
+            for raw_line in iter(proc.stderr.readline, b""):
+                if not raw_line:
+                    break
+                line = raw_line.decode("utf-8", errors="replace").rstrip()
+                if line:
+                    print(f"[ffmpeg] {line}")
+        except Exception as e:
+            print(f"[ffmpeg] stderr 읽기 실패: {e}")
+        finally:
+            try:
+                return_code = proc.wait(timeout=0.1)
+                print(f"[ffmpeg] 프로세스 종료 code={return_code}")
+            except subprocess.TimeoutExpired:
+                pass
+
+    threading.Thread(target=_drain, name="ffmpeg-log", daemon=True).start()
 
 
 def resolve_stream_url(input_url):
@@ -582,7 +741,7 @@ def start_output_stream_process(width, height, fps):
             cmd,
             stdin=subprocess.PIPE,
             stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
         print("⚠️  ffmpeg를 찾을 수 없습니다. 로컬 저장만 계속 진행합니다.")
@@ -594,6 +753,7 @@ def start_output_stream_process(width, height, fps):
 
     print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL}")
     print(f"   키프레임 간격: 약 {gop_size / fps:.1f}초 ({gop_size} 프레임)")
+    start_ffmpeg_log_thread(proc)
     return proc
 
 
@@ -609,7 +769,9 @@ def stop_stream_process(proc):
 
     try:
         proc.wait(timeout=5)
+        print(f"[ffmpeg] stop 후 종료 code={proc.returncode}")
     except Exception:
+        print("[ffmpeg] stop timeout -> kill()")
         proc.kill()
 
 # ── video 모드 ────────────────────────────────────────────
@@ -820,6 +982,7 @@ def run_rtmp(state):
     ).start()
     fps_ctr   = FPSCounter(window=30, print_interval=30)
     last_frame_id = 0
+    last_output_frame_id = 0
     frame_idx = 0
     fail_cnt  = 0
     infer_count = 0
@@ -848,6 +1011,7 @@ def run_rtmp(state):
                         fps = cap_fps
                     frame_reader = LatestFrameReader(cap).start()
                     last_frame_id = 0
+                    last_output_frame_id = 0
                     fail_cnt = 0
                     print("✅ 입력 스트림 재연결 성공")
                     continue
@@ -870,16 +1034,22 @@ def run_rtmp(state):
             if (vis.shape[1], vis.shape[0]) != output_size:
                 vis_for_output = cv2.resize(vis, output_size)
 
-            output_writer.update_frame(vis_for_output)
+            repeat_count = max(1, frame_id - last_output_frame_id)
+            output_writer.submit_frame(vis_for_output, repeat_count=repeat_count)
+            last_output_frame_id = frame_id
 
             frame_idx += 1
             infer_count += 1
 
             if fps_ctr.should_print():
+                rss_mb = get_memory_usage_mb()
+                rss_text = f"{rss_mb:.1f}MB" if rss_mb is not None else "n/a"
                 print(
                     f"  [rtmp] 추론 {fps_ctr.fps():.1f} fps  "
                     f"(frame {fps_ctr.frame_count}, processed={infer_count}, "
-                    f"emitted={output_writer.output_frame_count}, source={w}x{h})"
+                    f"emitted={output_writer.output_frame_count}, "
+                    f"last_repeat={repeat_count}, queue={output_writer.pending_frames()}, "
+                    f"rss={rss_text}, source={w}x{h})"
                 )
 
             if SHOW_WINDOW:
@@ -914,6 +1084,7 @@ def run_rtmp(state):
 
 # ── 진입점 ───────────────────────────────────────────────
 if __name__ == "__main__":
+    setup_runtime_logging()
     state = RefereeState()
     start_input_listener(state)
 
