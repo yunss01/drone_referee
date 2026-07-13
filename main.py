@@ -540,7 +540,10 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
         cv2.putText(vis, status, (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
 
-    cv2.putText(vis, f"wheels:{len(wheels)}  lanes:{len(lane_data)}",
+    info_text = f"wheels:{len(wheels)}"
+    if DRAW_LANE_VIS:
+        info_text += f"  lanes:{len(lane_data)}"
+    cv2.putText(vis, info_text,
                 (10, 75), cv2.FONT_HERSHEY_SIMPLEX, 0.65,
                 (255, 255, 255), 2)
 

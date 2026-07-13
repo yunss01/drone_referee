@@ -37,6 +37,7 @@ CAMERA_REOPEN_DELAY_SEC = 2.0
 # 추론은 최신 프레임 기준으로만 수행하고, 출력은 원본 시간축을 유지한다.
 FRAME_SKIP = 1
 SHOW_WINDOW = False
+PROCESS_LONG_SIDE = 1280
 
 # 원본 라이브 송출
 RAW_STREAM_ENABLED = True
@@ -226,6 +227,27 @@ def apply_camera_settings(cap):
         cap.set(cv2.CAP_PROP_FPS, CAMERA_FPS)
 
 
+def _round_even(value):
+    value = max(2, int(round(value)))
+    if value % 2:
+        value += 1
+    return value
+
+
+def compute_processing_size(src_w, src_h, long_side=PROCESS_LONG_SIDE):
+    if src_w <= 0 or src_h <= 0:
+        return (1280, 720)
+
+    longest = max(src_w, src_h)
+    if longest <= long_side:
+        return (_round_even(src_w), _round_even(src_h))
+
+    scale = long_side / float(longest)
+    dst_w = _round_even(src_w * scale)
+    dst_h = _round_even(src_h * scale)
+    return (dst_w, dst_h)
+
+
 def open_camera_capture(retries=CAMERA_REOPEN_RETRIES, retry_delay=CAMERA_REOPEN_DELAY_SEC):
     cap = None
     for attempt in range(1, retries + 1):
@@ -349,13 +371,18 @@ def run_camera_dual_stream(state):
     if not fps or np.isnan(fps) or fps <= 0:
         fps = CAMERA_FPS or 30.0
 
-    output_size = (w, h)
+    raw_output_size = (w, h)
+    processed_output_size = compute_processing_size(w, h)
     raw_output_fps = fps
     processed_output_fps = fps
 
     print(f"🎥 캡처 입력 시작: /dev/video{CAM_NUM} ({w}×{h} @ {fps:.1f}fps)")
     print(f"   프레임 스킵: {FRAME_SKIP}")
-    print("   원본은 캡처 프레임 그대로 송출")
+    print(f"   원본 송출 해상도: {raw_output_size[0]}×{raw_output_size[1]}")
+    print(
+        f"   처리 입력/송출 해상도: {processed_output_size[0]}×{processed_output_size[1]} "
+        f"(모델 imgsz 기준 long-side {PROCESS_LONG_SIDE})"
+    )
     print("   처리본은 원본 시간축에 맞춰 반복 프레임을 보정")
 
     raw_writer, raw_saved_out, raw_status = build_output_target(
@@ -365,7 +392,7 @@ def run_camera_dual_stream(state):
         SAVE_RAW_OUTPUT,
         RAW_OUTPUT_PATH,
         raw_output_fps,
-        output_size,
+        raw_output_size,
     )
     processed_writer, processed_saved_out, processed_status = build_output_target(
         "처리본",
@@ -374,7 +401,7 @@ def run_camera_dual_stream(state):
         SAVE_PROCESSED_OUTPUT,
         PROCESSED_OUTPUT_PATH,
         processed_output_fps,
-        output_size,
+        processed_output_size,
     )
 
     print(f"   원본 송출 상태: {_stream_status_text(raw_status)}")
@@ -408,10 +435,16 @@ def run_camera_dual_stream(state):
 
                     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or w
                     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or h
+                    raw_output_size = (w, h)
+                    processed_output_size = compute_processing_size(w, h)
                     capture_reader = CameraCaptureDistributor(cap, raw_writer=raw_writer).start()
                     last_frame_id = 0
                     last_processed_frame_id = 0
-                    print("✅ 카메라 재연결 성공")
+                    print(
+                        "✅ 카메라 재연결 성공 "
+                        f"(raw={raw_output_size[0]}x{raw_output_size[1]}, "
+                        f"processed={processed_output_size[0]}x{processed_output_size[1]})"
+                    )
                     continue
                 time.sleep(0.01)
                 continue
@@ -422,13 +455,18 @@ def run_camera_dual_stream(state):
                 continue
 
             fps_ctr.tick()
-            frame = shared_main._apply_clahe(frame, clahe)
+            if (frame.shape[1], frame.shape[0]) != processed_output_size:
+                proc_frame = cv2.resize(frame, processed_output_size, interpolation=cv2.INTER_AREA)
+            else:
+                proc_frame = frame
+
+            proc_frame = shared_main._apply_clahe(proc_frame, clahe)
             vis, _ = shared_main.process_frame(
-                seg_model, wheel_det, trackers, frame, state
+                seg_model, wheel_det, trackers, proc_frame, state
             )
 
-            if (vis.shape[1], vis.shape[0]) != output_size:
-                vis = cv2.resize(vis, output_size)
+            if (vis.shape[1], vis.shape[0]) != processed_output_size:
+                vis = cv2.resize(vis, processed_output_size)
 
             repeat_count = max(1, frame_id - last_processed_frame_id)
             if processed_writer is not None:
@@ -448,7 +486,8 @@ def run_camera_dual_stream(state):
                     f"(processed={infer_count}, repeat={repeat_count}, "
                     f"raw_emit={raw_emitted}, raw_q={raw_queue}, "
                     f"proc_emit={proc_emitted}, proc_q={proc_queue}, "
-                    f"rss={rss_text}, source={w}x{h})"
+                    f"rss={rss_text}, source={w}x{h}, "
+                    f"proc={processed_output_size[0]}x{processed_output_size[1]})"
                 )
 
             if SHOW_WINDOW:
