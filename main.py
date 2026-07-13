@@ -50,6 +50,9 @@ MODE = 'rtmp'  # 'video' / 'image' / 'rtmp'
 VIDEO_INPUT  = "0035_D.mp4"
 VIDEO_OUTPUT = "0035_result_video_comp.mp4"
 
+IMAGE_INPUT  = "test.jpg"
+IMAGE_OUTPUT = "result_images/"
+
 # ── 라이브 스트림 모드 설정 ───────────────────────────────
 # INPUT_STREAM_URL        : 유튜브 라이브 페이지 또는 직접 스트림 URL
 # INPUT_STREAM_FORMAT     : yt-dlp 입력 포맷 우선순위
@@ -67,10 +70,7 @@ STREAM_OUTPUT_PATH     = "rtmp_result.mp4"
 RUNTIME_LOG_PATH       = "logs/drone_referee_runtime.log"
 
 # 유튜브 라이브 화면을 보면서 Enter를 누를 때의 지연 보정값(초)
-REPOSITION_TOGGLE_DELAY_SEC = 6.0
-
-IMAGE_INPUT  = "test.jpg"
-IMAGE_OUTPUT = "result_images/"
+REPOSITION_TOGGLE_DELAY_SEC = 0.0
 
 SEG_MODEL_PATH  = "model/best_seg_rev03_FP16.engine"
 POSE_MODEL_PATH = "model/best_referee_FP16.engine"
