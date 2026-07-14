@@ -87,7 +87,7 @@ SEG_MODEL_PATH  = "model/best_seg_rev03_FP16.engine"
 POSE_MODEL_PATH = "model/best_referee_FP16.engine"
 MAX_WHEELS      = 4
 SHOW_WINDOW     = False
-DRAW_LANE_VIS   = True
+DRAW_LANE_VIS   = True # 점선 표시 여부
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
