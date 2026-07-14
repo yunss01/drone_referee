@@ -14,6 +14,7 @@ import os
 import time
 import threading
 import subprocess
+from collections import deque
 
 import cv2
 import numpy as np
@@ -257,6 +258,92 @@ def open_named_video_writer(enabled, out_path, fps, size, name):
     return writer
 
 
+class RealtimeOutputWriter:
+    def __init__(self, fps, saved_out=None, stream_proc=None, stream_status="disabled"):
+        self.interval = 1.0 / fps if fps and fps > 0 else 1.0 / 30.0
+        self.saved_out = saved_out
+        self.stream_proc = stream_proc
+        self.stream_status = stream_status
+        self.output_frame_count = 0
+
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._stop = False
+        self._queue = deque()
+        self._last_frame = None
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def submit_frame(self, frame, repeat_count=1):
+        with self._cond:
+            self._queue.append([frame.copy(), max(1, int(repeat_count))])
+            self._cond.notify_all()
+
+    def _run(self):
+        with self._cond:
+            while not self._queue and not self._stop:
+                self._cond.wait(timeout=0.1)
+
+        next_tick = time.perf_counter()
+        while True:
+            with self._cond:
+                if self._stop:
+                    return
+                if self._queue:
+                    frame, _repeats_left = self._queue[0]
+                    self._last_frame = frame
+                    self._queue[0][1] -= 1
+                    if self._queue[0][1] <= 0:
+                        self._queue.popleft()
+                else:
+                    frame = self._last_frame
+                stream_proc = self.stream_proc
+
+            if frame is not None:
+                if self.saved_out is not None:
+                    self.saved_out.write(frame)
+
+                if stream_proc is not None and stream_proc.stdin is not None:
+                    try:
+                        stream_proc.stdin.write(frame.tobytes())
+                    except (BrokenPipeError, OSError):
+                        print("⚠️  유튜브 송출 연결이 끊겼습니다. 로컬 저장만 계속 진행합니다.")
+                        stop_named_stream_process("writer", stream_proc)
+                        with self._cond:
+                            if self.stream_proc is stream_proc:
+                                self.stream_proc = None
+                                self.stream_status = "disconnected"
+
+                self.output_frame_count += 1
+
+            next_tick += self.interval
+            delay = next_tick - time.perf_counter()
+            if delay > 0:
+                time.sleep(delay)
+            else:
+                next_tick = time.perf_counter()
+
+    def stop(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+        if self.stream_proc is not None:
+            stop_named_stream_process("writer", self.stream_proc)
+            self.stream_proc = None
+
+    def pending_frames(self):
+        with self._cond:
+            return len(self._queue)
+
+
 def build_output_target(name, stream_enabled, stream_url, save_enabled, save_path, fps, size):
     saved_out = open_named_video_writer(save_enabled, save_path, fps, size, name)
     stream_proc, stream_status = start_output_stream_process(
@@ -267,7 +354,7 @@ def build_output_target(name, stream_enabled, stream_url, save_enabled, save_pat
         print(f"ℹ️  {name}: 로컬 저장/라이브 송출 모두 비활성 또는 시작 실패")
         return None, None, stream_status
 
-    writer = shared_main.RealtimeOutputWriter(
+    writer = RealtimeOutputWriter(
         fps,
         saved_out=saved_out,
         stream_proc=stream_proc,

@@ -4,7 +4,7 @@ main.py  —  드론 심판 시스템 통합 실행
 MODE 설정:
   'video'  : 영상 파일 처리 후 결과 영상 저장
   'image'  : 이미지 1장 또는 폴더 전체 처리 후 저장
-  'rtmp'   : 유튜브 라이브/RTMP 입력 → 추론 → 유튜브 RTMP 재송출
+  'rtmp'   : 유튜브/RTMP 입력을 디스크 세그먼트로 스풀 후 순차 추론 → 유튜브 RTMP 재송출
 
 재위치 토글:
   터미널에서 Enter 키 → 재위치 모드 ON/OFF
@@ -24,7 +24,6 @@ import signal
 import atexit
 import traceback
 import faulthandler
-from collections import deque
 import numpy as np
 from ultralytics import YOLO
 
@@ -60,14 +59,26 @@ IMAGE_OUTPUT = "result_images/"
 # OUTPUT_STREAM_RTMP_URL  : 유튜브 라이브 송출 주소
 # SAVE_STREAM_OUTPUT      : 추론된 결과 영상을 로컬 mp4로 저장할지 여부
 # STREAM_OUTPUT_PATH      : 로컬 저장 파일 경로
-INPUT_STREAM_URL       = "https://www.youtube.com/watch?v=8arb_a5Z4KQ"
-INPUT_STREAM_FORMAT    = "bestvideo[height<=720]/best[height<=720]/bestvideo/best"
+INPUT_STREAM_URL       = "https://youtube.com/live/--fQWyY7W-k" # 드론 영상 유튜브 라이크 링크
+INPUT_STREAM_FORMAT    = (
+    "bestvideo[height<=1080][vcodec*=avc1]/"
+    "best[height<=1080][vcodec*=avc1]/"
+    "bestvideo[height<=1080]/best[height<=1080]/bestvideo/best"
+)
 OUTPUT_STREAM_ENABLED  = True
-OUTPUT_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fsj7"
-OUTPUT_STREAM_PRESET   = "veryfast"
-SAVE_STREAM_OUTPUT     = True
+OUTPUT_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fsj7" # 성균관대학교노승윤 계정
+SAVE_STREAM_OUTPUT     = False
 STREAM_OUTPUT_PATH     = "rtmp_result.mp4"
 RUNTIME_LOG_PATH       = "logs/drone_referee_runtime.log"
+SPOOL_ROOT_DIR         = "spool_sessions"
+SPOOL_SEGMENT_SECONDS  = 10
+KEEP_INPUT_SEGMENTS    = False
+DELETE_INPUT_SEGMENTS_AFTER_PROCESS = True
+SPOOL_POLL_INTERVAL_SEC = 0.5
+STREAM_VIDEO_ENCODER   = "h264_nvenc"
+CPU_FALLBACK_VIDEO_ENCODER = "libx264"
+NVENC_PRESET           = "p5"
+X264_PRESET            = "veryfast"
 
 # 유튜브 라이브 화면을 보면서 Enter를 누를 때의 지연 보정값(초)
 REPOSITION_TOGGLE_DELAY_SEC = 0.0
@@ -81,8 +92,6 @@ DRAW_LANE_VIS   = True
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
 FRAME_SKIP = 1
-STREAM_READ_TIMEOUT_SEC = 2.0
-STREAM_INPUT_QUEUE_MAX_FRAMES = 120
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -290,235 +299,6 @@ class FPSCounter:
         return self.frame_count % self.print_interval == 0
 
 
-class LatestFrameReader:
-    def __init__(self, cap):
-        self.cap = cap
-        self._cond = threading.Condition()
-        self._stop = False
-        self._frame = None
-        self._frame_id = 0
-        self._fail_count = 0
-        self._thread = None
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def _run(self):
-        while True:
-            with self._cond:
-                if self._stop:
-                    return
-
-            ret, frame = self.cap.read()
-
-            with self._cond:
-                if self._stop:
-                    return
-
-                if ret and frame is not None:
-                    self._frame = frame
-                    self._frame_id += 1
-                    self._fail_count = 0
-                else:
-                    self._fail_count += 1
-                self._cond.notify_all()
-
-            if not ret:
-                time.sleep(0.01)
-
-    def read_latest(self, last_frame_id, timeout_sec=1.0):
-        deadline = time.time() + timeout_sec
-        with self._cond:
-            while (
-                not self._stop
-                and self._frame_id <= last_frame_id
-                and self._fail_count == 0
-            ):
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                self._cond.wait(timeout=remaining)
-
-            if self._frame_id > last_frame_id and self._frame is not None:
-                return self._frame_id, self._frame.copy(), self._fail_count
-
-            return last_frame_id, None, self._fail_count
-
-    def stop(self):
-        with self._cond:
-            self._stop = True
-            self._cond.notify_all()
-
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-
-
-class BufferedFrameReader:
-    def __init__(self, cap, max_queue_frames=STREAM_INPUT_QUEUE_MAX_FRAMES):
-        self.cap = cap
-        self.max_queue_frames = max(1, int(max_queue_frames))
-        self._cond = threading.Condition()
-        self._stop = False
-        self._queue = deque()
-        self._frame_id = 0
-        self._fail_count = 0
-        self._thread = None
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def _run(self):
-        while True:
-            with self._cond:
-                while (
-                    not self._stop
-                    and len(self._queue) >= self.max_queue_frames
-                ):
-                    self._cond.wait(timeout=0.1)
-
-                if self._stop:
-                    return
-
-            ret, frame = self.cap.read()
-
-            with self._cond:
-                if self._stop:
-                    return
-
-                if ret and frame is not None:
-                    self._frame_id += 1
-                    self._queue.append((self._frame_id, frame))
-                    self._fail_count = 0
-                else:
-                    self._fail_count += 1
-                self._cond.notify_all()
-
-            if not ret:
-                time.sleep(0.01)
-
-    def read_next(self, timeout_sec=1.0):
-        deadline = time.time() + timeout_sec
-        with self._cond:
-            while (
-                not self._stop
-                and not self._queue
-                and self._fail_count == 0
-            ):
-                remaining = deadline - time.time()
-                if remaining <= 0:
-                    break
-                self._cond.wait(timeout=remaining)
-
-            if self._queue:
-                frame_id, frame = self._queue.popleft()
-                self._cond.notify_all()
-                return frame_id, frame, self._fail_count
-
-            return 0, None, self._fail_count
-
-    def pending_frames(self):
-        with self._cond:
-            return len(self._queue)
-
-    def stop(self):
-        with self._cond:
-            self._stop = True
-            self._cond.notify_all()
-
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=1.0)
-
-
-class RealtimeOutputWriter:
-    def __init__(self, fps, saved_out=None, stream_proc=None, stream_status="disabled"):
-        self.interval = 1.0 / fps if fps and fps > 0 else 1.0 / 30.0
-        self.saved_out = saved_out
-        self.stream_proc = stream_proc
-        self.stream_status = stream_status
-        self.output_frame_count = 0
-
-        self._lock = threading.Lock()
-        self._cond = threading.Condition(self._lock)
-        self._stop = False
-        self._queue = deque()
-        self._last_frame = None
-        self._thread = None
-
-    def start(self):
-        self._thread = threading.Thread(target=self._run, daemon=True)
-        self._thread.start()
-        return self
-
-    def submit_frame(self, frame, repeat_count=1):
-        with self._cond:
-            self._queue.append([frame.copy(), max(1, int(repeat_count))])
-            self._cond.notify_all()
-
-    def _run(self):
-        with self._cond:
-            while not self._queue and not self._stop:
-                self._cond.wait(timeout=0.1)
-
-        next_tick = time.perf_counter()
-        while True:
-            with self._cond:
-                if self._stop:
-                    return
-                if self._queue:
-                    frame, repeats_left = self._queue[0]
-                    self._last_frame = frame
-                    self._queue[0][1] -= 1
-                    if self._queue[0][1] <= 0:
-                        self._queue.popleft()
-                else:
-                    frame = self._last_frame
-                stream_proc = self.stream_proc
-
-            if frame is not None:
-                if self.saved_out is not None:
-                    self.saved_out.write(frame)
-
-                if stream_proc is not None and stream_proc.stdin is not None:
-                    try:
-                        stream_proc.stdin.write(frame.tobytes())
-                    except (BrokenPipeError, OSError):
-                        print("⚠️  유튜브 송출 연결이 끊겼습니다. 로컬 저장만 계속 진행합니다.")
-                        stop_stream_process(stream_proc)
-                        with self._cond:
-                            if self.stream_proc is stream_proc:
-                                self.stream_proc = None
-                                self.stream_status = "disconnected"
-
-                self.output_frame_count += 1
-
-            next_tick += self.interval
-            delay = next_tick - time.perf_counter()
-            if delay > 0:
-                time.sleep(delay)
-            else:
-                next_tick = time.perf_counter()
-
-    def stop(self):
-        with self._cond:
-            self._stop = True
-            self._cond.notify_all()
-
-        if self._thread is not None and self._thread.is_alive():
-            self._thread.join(timeout=2.0)
-
-        if self.stream_proc is not None:
-            stop_stream_process(self.stream_proc)
-            self.stream_proc = None
-
-    def pending_frames(self):
-        with self._cond:
-            return len(self._queue)
-
-
 # ── 차선 데이터 구성 (Step 1~4) ──────────────────────────
 def build_lane_data(seg_model, frame):
     instance_masks = run_segmentation(seg_model, frame)
@@ -669,7 +449,7 @@ def load_models():
     return seg_model, wheel_det, trackers
 
 
-def start_ffmpeg_log_thread(proc):
+def start_ffmpeg_log_thread(proc, name="ffmpeg"):
     if proc.stderr is None:
         return
 
@@ -680,13 +460,13 @@ def start_ffmpeg_log_thread(proc):
                     break
                 line = raw_line.decode("utf-8", errors="replace").rstrip()
                 if line:
-                    print(f"[ffmpeg] {line}")
+                    print(f"[{name}] {line}")
         except Exception as e:
-            print(f"[ffmpeg] stderr 읽기 실패: {e}")
+            print(f"[{name}] stderr 읽기 실패: {e}")
         finally:
             try:
                 return_code = proc.wait(timeout=0.1)
-                print(f"[ffmpeg] 프로세스 종료 code={return_code}")
+                print(f"[{name}] 프로세스 종료 code={return_code}")
             except subprocess.TimeoutExpired:
                 pass
 
@@ -745,34 +525,68 @@ def resolve_stream_url(input_url):
     return None
 
 
-def open_stream_capture(stream_url, retries=10, retry_delay=3.0):
-    cap = None
-    for attempt in range(1, retries + 1):
-        if cap is not None:
-            cap.release()
+def pick_stream_bitrate(width, height, fps):
+    pixels = width * height
+    fps_scale = 1.5 if fps > 30.5 else 1.0
 
-        cap = cv2.VideoCapture(stream_url, cv2.CAP_FFMPEG)
-        if cap.isOpened():
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            return cap
-        cap.release()
+    if pixels >= 3840 * 2160:
+        bitrate_mbps = 22.0
+        maxrate_mbps = 28.0
+        cq = 19
+    elif pixels >= 2560 * 1440:
+        bitrate_mbps = 12.0
+        maxrate_mbps = 16.0
+        cq = 20
+    elif pixels >= 1920 * 1080:
+        bitrate_mbps = 8.0
+        maxrate_mbps = 10.0
+        cq = 20
+    elif pixels >= 1280 * 720:
+        bitrate_mbps = 5.0
+        maxrate_mbps = 7.0
+        cq = 21
+    else:
+        bitrate_mbps = 3.0
+        maxrate_mbps = 4.5
+        cq = 22
 
-        cap = cv2.VideoCapture(stream_url)
-        if cap.isOpened():
-            try:
-                cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
-            except Exception:
-                pass
-            return cap
-        cap.release()
+    bitrate_mbps *= fps_scale
+    maxrate_mbps *= fps_scale
+    bufsize_mbps = bitrate_mbps * 2.0
 
-        print(f"  ⏳ 입력 스트림 연결 실패, 재시도 중... ({attempt}/{retries})")
-        time.sleep(retry_delay)
+    return {
+        "b:v": f"{bitrate_mbps:.1f}M",
+        "maxrate": f"{maxrate_mbps:.1f}M",
+        "bufsize": f"{bufsize_mbps:.1f}M",
+        "cq": str(cq),
+    }
 
-    return None
+
+def build_video_encoder_args(width, height, fps, encoder_name=STREAM_VIDEO_ENCODER):
+    bitrate = pick_stream_bitrate(width, height, fps)
+
+    if encoder_name == "h264_nvenc":
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", NVENC_PRESET,
+            "-rc", "vbr",
+            "-cq", bitrate["cq"],
+            "-b:v", bitrate["b:v"],
+            "-maxrate", bitrate["maxrate"],
+            "-bufsize", bitrate["bufsize"],
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ], bitrate
+
+    return [
+        "-c:v", CPU_FALLBACK_VIDEO_ENCODER,
+        "-preset", X264_PRESET,
+        "-tune", "zerolatency",
+        "-b:v", bitrate["b:v"],
+        "-maxrate", bitrate["maxrate"],
+        "-bufsize", bitrate["bufsize"],
+        "-pix_fmt", "yuv420p",
+    ], bitrate
 
 
 def start_output_stream_process(width, height, fps):
@@ -789,6 +603,7 @@ def start_output_stream_process(width, height, fps):
 
     # YouTube 권장에 맞춰 2초 간격으로 키프레임을 고정한다.
     gop_size = max(1, int(round(fps * 2)))
+    video_args, bitrate = build_video_encoder_args(width, height, fps)
 
     cmd = [
         "ffmpeg",
@@ -803,13 +618,10 @@ def start_output_stream_process(width, height, fps):
         "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-c:v", "libx264",
-        "-preset", OUTPUT_STREAM_PRESET,
-        "-tune", "zerolatency",
+    ] + video_args + [
         "-g", str(gop_size),
         "-keyint_min", str(gop_size),
         "-sc_threshold", "0",
-        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
@@ -834,6 +646,10 @@ def start_output_stream_process(width, height, fps):
         return None
 
     print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL}")
+    print(
+        f"   encoder={STREAM_VIDEO_ENCODER}  bitrate={bitrate['b:v']}  "
+        f"maxrate={bitrate['maxrate']}  bufsize={bitrate['bufsize']}  cq={bitrate['cq']}"
+    )
     print(f"   키프레임 간격: 약 {gop_size / fps:.1f}초 ({gop_size} 프레임)")
     start_ffmpeg_log_thread(proc)
     return proc
@@ -855,6 +671,138 @@ def stop_stream_process(proc):
     except Exception:
         print("[ffmpeg] stop timeout -> kill()")
         proc.kill()
+
+
+def stream_status_text(status):
+    return {
+        "disabled": "사용 안 함",
+        "start_failed": "시작 실패",
+        "streaming": "종료 시점까지 송출 유지",
+        "disconnected": "중간에 연결 끊김",
+    }.get(status, status)
+
+
+def make_spool_session_dirs():
+    session_name = time.strftime("%Y%m%d_%H%M%S")
+    session_dir = os.path.join(SPOOL_ROOT_DIR, session_name)
+    segments_dir = os.path.join(session_dir, "input_segments")
+    markers_dir = os.path.join(session_dir, "processed_markers")
+    os.makedirs(segments_dir, exist_ok=True)
+    os.makedirs(markers_dir, exist_ok=True)
+    return session_dir, segments_dir, markers_dir
+
+
+def build_spool_record_command(stream_url, segments_dir):
+    segment_pattern = os.path.join(segments_dir, "input_%06d.mkv")
+    return [
+        "ffmpeg",
+        "-loglevel", "error",
+        "-y",
+        "-reconnect", "1",
+        "-reconnect_streamed", "1",
+        "-reconnect_delay_max", "5",
+        "-fflags", "+genpts",
+        "-i", stream_url,
+        "-map", "0:v:0",
+        "-an",
+        "-c:v", "copy",
+        "-f", "segment",
+        "-segment_time", str(SPOOL_SEGMENT_SECONDS),
+        "-reset_timestamps", "1",
+        "-segment_format", "matroska",
+        segment_pattern,
+    ]
+
+
+def start_spool_recorder(stream_url, segments_dir):
+    cmd = build_spool_record_command(stream_url, segments_dir)
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        print("❌ ffmpeg를 찾을 수 없습니다.")
+        return None
+    except Exception as e:
+        print(f"❌ 입력 스풀 레코더 시작 실패: {e}")
+        return None
+
+    print(f"📼 입력 세그먼트 저장 시작 → {segments_dir}")
+    print(f"   세그먼트 길이: {SPOOL_SEGMENT_SECONDS}초")
+    print(
+        f"   입력 세그먼트 최종 보존: {'ON' if KEEP_INPUT_SEGMENTS else 'OFF'} "
+        f"(처리 후 삭제: {'ON' if DELETE_INPUT_SEGMENTS_AFTER_PROCESS else 'OFF'})"
+    )
+    start_ffmpeg_log_thread(proc, name="ffmpeg:spool-input")
+    return proc
+
+
+def marker_path_for(segment_path, markers_dir):
+    stem = os.path.splitext(os.path.basename(segment_path))[0]
+    return os.path.join(markers_dir, f"{stem}.done")
+
+
+def list_processable_segments(segments_dir, markers_dir, recorder_alive):
+    segment_files = sorted(
+        os.path.join(segments_dir, name)
+        for name in os.listdir(segments_dir)
+        if name.startswith("input_") and name.endswith(".mkv")
+    )
+
+    if recorder_alive and len(segment_files) > 1:
+        candidates = segment_files[:-1]
+    else:
+        candidates = segment_files
+
+    ready = []
+    for path in candidates:
+        marker_path = marker_path_for(path, markers_dir)
+        if os.path.exists(marker_path):
+            continue
+        try:
+            if os.path.getsize(path) <= 0:
+                continue
+        except OSError:
+            continue
+        ready.append(path)
+    return ready
+
+
+def probe_segment(path):
+    cap = cv2.VideoCapture(path)
+    if not cap.isOpened():
+        return None
+
+    width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+    height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+    fps = cap.get(cv2.CAP_PROP_FPS)
+    frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    cap.release()
+
+    if not fps or np.isnan(fps) or fps <= 0:
+        fps = 30.0
+
+    return {
+        "width": width,
+        "height": height,
+        "fps": fps,
+        "frames": frames,
+    }
+
+
+def mark_segment_processed(segment_path, markers_dir):
+    marker_path = marker_path_for(segment_path, markers_dir)
+    with open(marker_path, "w", encoding="utf-8") as f:
+        f.write("done\n")
+
+    if DELETE_INPUT_SEGMENTS_AFTER_PROCESS and not KEEP_INPUT_SEGMENTS:
+        try:
+            os.remove(segment_path)
+        except FileNotFoundError:
+            pass
 
 # ── video 모드 ────────────────────────────────────────────
 def run_video(state):
@@ -996,11 +944,9 @@ def run_image(state):
 # ── rtmp 모드 ─────────────────────────────────────────────
 def run_rtmp(state):
     """
-    유튜브 라이브 또는 RTMP 스트림을 입력으로 받아 추론하고,
-    결과를 유튜브 RTMP로 재송출하거나 로컬 mp4로 저장한다.
+    유튜브 라이브/VOD 또는 RTMP 입력을 디스크 세그먼트로 먼저 저장한 뒤,
+    완료된 세그먼트를 순서대로 추론해서 유튜브 RTMP로 재송출하거나 로컬 mp4로 저장한다.
     """
-    seg_model, wheel_det, trackers = load_models()
-
     print(f"📡 스트림 모드 입력: {INPUT_STREAM_URL}")
     print(f"   종료: Ctrl+C\n")
 
@@ -1008,161 +954,229 @@ def run_rtmp(state):
     if not stream_url:
         return
 
-    cap = open_stream_capture(stream_url, retries=10, retry_delay=3.0)
-    if cap is None or not cap.isOpened():
-        print(f"❌ 스트림에 연결할 수 없습니다.")
+    if KEEP_INPUT_SEGMENTS and DELETE_INPUT_SEGMENTS_AFTER_PROCESS:
+        print("❌ KEEP_INPUT_SEGMENTS=True 와 DELETE_INPUT_SEGMENTS_AFTER_PROCESS=True는 동시에 사용할 수 없습니다.")
         return
 
-    w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-    h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-    fps = cap.get(cv2.CAP_PROP_FPS)
-    if not fps or np.isnan(fps) or fps <= 0:
-        fps = 30.0
-    output_fps = fps / FRAME_SKIP
-    output_size = (w, h)
+    session_dir, segments_dir, markers_dir = make_spool_session_dirs()
+    print(f"📁 세션 폴더: {session_dir}")
 
-    print(f"✅ 스트림 연결 성공: {w}×{h} @ {fps:.1f}fps")
-    print(f"   프레임 스킵: {FRAME_SKIP}")
-    print(f"   입력 버퍼: FIFO {STREAM_INPUT_QUEUE_MAX_FRAMES}프레임\n")
+    recorder_proc = start_spool_recorder(stream_url, segments_dir)
+    if recorder_proc is None:
+        return
+
+    seg_model, wheel_det, trackers = load_models()
 
     saved_out = None
-    if SAVE_STREAM_OUTPUT:
-        out_dir = os.path.dirname(STREAM_OUTPUT_PATH)
-        if out_dir:
-            os.makedirs(out_dir, exist_ok=True)
-        saved_out = cv2.VideoWriter(
-            STREAM_OUTPUT_PATH,
-            cv2.VideoWriter_fourcc(*'mp4v'),
-            output_fps,
-            output_size,
-        )
-        if not saved_out.isOpened():
-            print(f"⚠️  결과 저장 파일을 열 수 없습니다: {STREAM_OUTPUT_PATH}")
-            saved_out.release()
-            saved_out = None
+    stream_proc = None
+    stream_status = "disabled"
+    output_size = None
+    output_fps = 0.0
+    output_frame_count = 0
 
-    stream_proc = start_output_stream_process(w, h, output_fps)
-    if not OUTPUT_STREAM_ENABLED:
-        stream_status = "disabled"
-    elif stream_proc is None:
-        stream_status = "start_failed"
-    else:
-        stream_status = "streaming"
-
-    print(f"   로컬 저장: {'ON' if saved_out else 'OFF'}")
-    if SAVE_STREAM_OUTPUT:
-        print(f"   저장 경로: {STREAM_OUTPUT_PATH}")
-    print(f"   유튜브 송출: {'ON' if stream_proc else 'OFF'}")
-    print(f"   출력 FPS: {output_fps:.1f} (입력은 순서대로 처리, 지연이 누적될 수 있음)\n")
-
-    clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
-    frame_reader = BufferedFrameReader(cap).start()
-    output_writer = RealtimeOutputWriter(
-        output_fps,
-        saved_out=saved_out,
-        stream_proc=stream_proc,
-        stream_status=stream_status,
-    ).start()
-    fps_ctr   = FPSCounter(window=30, print_interval=30)
-    last_frame_id = 0
-    last_output_frame_id = 0
+    clahe = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
+    fps_ctr = FPSCounter(window=30, print_interval=30)
     frame_idx = 0
-    fail_cnt  = 0
     infer_count = 0
+    total_processed_segments = 0
+    total_processed_frames = 0
+    last_wait_log_at = 0.0
 
     try:
         while True:
-            frame_id, frame, reader_fail_cnt = frame_reader.read_next(
-                timeout_sec=STREAM_READ_TIMEOUT_SEC,
+            recorder_alive = recorder_proc.poll() is None
+            pending_segments = list_processable_segments(
+                segments_dir,
+                markers_dir,
+                recorder_alive,
             )
-            if frame is None:
-                fail_cnt = max(fail_cnt + 1, reader_fail_cnt)
-                if fail_cnt >= 30:
-                    print("⚠️  입력 스트림이 끊겨 재연결을 시도합니다.")
-                    frame_reader.stop()
-                    cap.release()
-                    cap = open_stream_capture(stream_url, retries=5, retry_delay=2.0)
-                    if cap is None or not cap.isOpened():
-                        print("❌ 입력 스트림 재연결 실패")
-                        break
 
-                    w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or w
-                    h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or h
-                    cap_fps = cap.get(cv2.CAP_PROP_FPS)
-                    if cap_fps and not np.isnan(cap_fps) and cap_fps > 0:
-                        fps = cap_fps
-                    frame_reader = BufferedFrameReader(cap).start()
-                    last_frame_id = 0
-                    last_output_frame_id = 0
-                    fail_cnt = 0
-                    print("✅ 입력 스트림 재연결 성공")
-                    continue
-                time.sleep(0.02)
-                continue
-
-            last_frame_id = frame_id
-            fail_cnt = 0
-
-            if frame_idx % FRAME_SKIP != 0:
-                frame_idx += 1
-                continue
-
-            fps_ctr.tick()
-            frame = _apply_clahe(frame, clahe)
-            vis, _ = process_frame(
-                seg_model, wheel_det, trackers, frame, state
-            )
-            vis_for_output = vis
-            if (vis.shape[1], vis.shape[0]) != output_size:
-                vis_for_output = cv2.resize(vis, output_size)
-
-            repeat_count = max(1, frame_id - last_output_frame_id)
-            output_writer.submit_frame(vis_for_output, repeat_count=repeat_count)
-            last_output_frame_id = frame_id
-
-            frame_idx += 1
-            infer_count += 1
-
-            if fps_ctr.should_print():
-                rss_mb = get_memory_usage_mb()
-                rss_text = f"{rss_mb:.1f}MB" if rss_mb is not None else "n/a"
-                print(
-                    f"  [rtmp] 추론 {fps_ctr.fps():.1f} fps  "
-                    f"(frame {fps_ctr.frame_count}, processed={infer_count}, "
-                    f"emitted={output_writer.output_frame_count}, "
-                    f"last_repeat={repeat_count}, in_q={frame_reader.pending_frames()}, "
-                    f"out_q={output_writer.pending_frames()}, "
-                    f"rss={rss_text}, source={w}x{h})"
-                )
-
-            if SHOW_WINDOW:
-                cv2.imshow("Drone Referee - RTMP", vis)
-                if cv2.waitKey(1) & 0xFF == ord('q'):
+            if not pending_segments:
+                if not recorder_alive:
                     break
 
+                now = time.time()
+                if now - last_wait_log_at >= 10.0:
+                    saved_segments = len([
+                        name for name in os.listdir(segments_dir)
+                        if name.startswith("input_") and name.endswith(".mkv")
+                    ])
+                    processed_segments = len([
+                        name for name in os.listdir(markers_dir)
+                        if name.endswith(".done")
+                    ])
+                    print(
+                        f"  [spool] 대기 중... "
+                        f"(saved={saved_segments}, processed={processed_segments}, session={os.path.basename(session_dir)})"
+                    )
+                    last_wait_log_at = now
+                time.sleep(SPOOL_POLL_INTERVAL_SEC)
+                continue
+
+            for segment_path in pending_segments:
+                meta = probe_segment(segment_path)
+                if meta is None:
+                    print(f"⚠️  세그먼트 메타데이터 확인 실패: {segment_path}")
+                    mark_segment_processed(segment_path, markers_dir)
+                    continue
+
+                if output_size is None:
+                    output_size = (meta["width"], meta["height"])
+                    output_fps = meta["fps"] / FRAME_SKIP
+                    if not output_fps or np.isnan(output_fps) or output_fps <= 0:
+                        output_fps = 30.0
+
+                    print(f"✅ 스풀 처리 시작: {meta['width']}×{meta['height']} @ {meta['fps']:.1f}fps")
+                    print(f"   프레임 스킵: {FRAME_SKIP}")
+                    print(f"   처리 결과 출력 FPS: {output_fps:.1f}")
+
+                    if SAVE_STREAM_OUTPUT:
+                        out_dir = os.path.dirname(STREAM_OUTPUT_PATH)
+                        if out_dir:
+                            os.makedirs(out_dir, exist_ok=True)
+                        saved_out = cv2.VideoWriter(
+                            STREAM_OUTPUT_PATH,
+                            cv2.VideoWriter_fourcc(*'mp4v'),
+                            output_fps,
+                            output_size,
+                        )
+                        if not saved_out.isOpened():
+                            print(f"⚠️  결과 저장 파일을 열 수 없습니다: {STREAM_OUTPUT_PATH}")
+                            saved_out.release()
+                            saved_out = None
+
+                    stream_proc = start_output_stream_process(
+                        output_size[0],
+                        output_size[1],
+                        output_fps,
+                    )
+                    if not OUTPUT_STREAM_ENABLED:
+                        stream_status = "disabled"
+                    elif stream_proc is None:
+                        stream_status = "start_failed"
+                    else:
+                        stream_status = "streaming"
+
+                    print(f"   로컬 저장: {'ON' if saved_out else 'OFF'}")
+                    if SAVE_STREAM_OUTPUT:
+                        print(f"   저장 경로: {STREAM_OUTPUT_PATH}")
+                    print(f"   유튜브 송출: {'ON' if stream_proc else 'OFF'}\n")
+
+                print(
+                    f"🎞️  세그먼트 처리 시작: {os.path.basename(segment_path)} "
+                    f"({meta['width']}×{meta['height']} @ {meta['fps']:.1f}fps, frames={meta['frames']})"
+                )
+
+                cap = cv2.VideoCapture(segment_path)
+                if not cap.isOpened():
+                    print(f"⚠️  세그먼트를 열 수 없습니다: {segment_path}")
+                    mark_segment_processed(segment_path, markers_dir)
+                    continue
+
+                segment_written = 0
+                while True:
+                    ret, frame = cap.read()
+                    if not ret:
+                        break
+
+                    if frame_idx % FRAME_SKIP != 0:
+                        frame_idx += 1
+                        continue
+
+                    fps_ctr.tick()
+                    frame = _apply_clahe(frame, clahe)
+                    vis, _ = process_frame(
+                        seg_model, wheel_det, trackers, frame, state
+                    )
+                    vis_for_output = vis
+                    if (vis.shape[1], vis.shape[0]) != output_size:
+                        vis_for_output = cv2.resize(vis, output_size)
+
+                    if saved_out is not None:
+                        saved_out.write(vis_for_output)
+
+                    if stream_proc is not None and stream_proc.stdin is not None:
+                        try:
+                            stream_proc.stdin.write(vis_for_output.tobytes())
+                        except (BrokenPipeError, OSError):
+                            print("⚠️  유튜브 송출 연결이 끊겼습니다. 로컬 저장만 계속 진행합니다.")
+                            stop_stream_process(stream_proc)
+                            stream_proc = None
+                            stream_status = "disconnected"
+
+                    output_frame_count += 1
+                    frame_idx += 1
+                    infer_count += 1
+                    total_processed_frames += 1
+                    segment_written += 1
+
+                    if fps_ctr.should_print():
+                        rss_mb = get_memory_usage_mb()
+                        rss_text = f"{rss_mb:.1f}MB" if rss_mb is not None else "n/a"
+                        saved_segments = len([
+                            name for name in os.listdir(segments_dir)
+                            if name.startswith("input_") and name.endswith(".mkv")
+                        ])
+                        processed_segments = len([
+                            name for name in os.listdir(markers_dir)
+                            if name.endswith(".done")
+                        ])
+                        backlog = max(0, saved_segments - processed_segments)
+                        print(
+                            f"  [rtmp-spool] 추론 {fps_ctr.fps():.1f} fps  "
+                            f"(processed={infer_count}, written={output_frame_count}, "
+                            f"segments={total_processed_segments}, backlog={backlog}, "
+                            f"rss={rss_text}, source={output_size[0]}x{output_size[1]})"
+                        )
+
+                    if SHOW_WINDOW:
+                        cv2.imshow("Drone Referee - RTMP", vis_for_output)
+                        if cv2.waitKey(1) & 0xFF == ord('q'):
+                            raise KeyboardInterrupt
+
+                cap.release()
+                mark_segment_processed(segment_path, markers_dir)
+                total_processed_segments += 1
+
+                rss_mb = get_memory_usage_mb()
+                rss_text = f"{rss_mb:.1f}MB" if rss_mb is not None else "n/a"
+                saved_segments = len([
+                    name for name in os.listdir(segments_dir)
+                    if name.startswith("input_") and name.endswith(".mkv")
+                ])
+                processed_segments = len([
+                    name for name in os.listdir(markers_dir)
+                    if name.endswith(".done")
+                ])
+                backlog = max(0, saved_segments - processed_segments)
+                print(
+                    f"  [rtmp-spool] segment={os.path.basename(segment_path)} done  "
+                    f"(segment_frames={segment_written}, total_frames={total_processed_frames}, "
+                    f"segments_done={total_processed_segments}, backlog={backlog}, "
+                    f"infer={fps_ctr.fps():.1f}fps, rss={rss_text})"
+                )
+
     except KeyboardInterrupt:
-        pass
+        print("\n[중단] 사용자 요청으로 스풀 처리를 종료합니다.")
     finally:
-        frame_reader.stop()
-        cap.release()
-        output_writer.stop()
+        if recorder_proc.poll() is None:
+            stop_stream_process(recorder_proc)
+        if stream_proc is not None:
+            stop_stream_process(stream_proc)
+            stream_proc = None
         if saved_out:
             saved_out.release()
         if SHOW_WINDOW:
             cv2.destroyAllWindows()
 
     print(f"\n✅ 종료  |  추론 평균 FPS: {fps_ctr.fps():.1f}")
+    print(f"   처리 세그먼트 수: {total_processed_segments}")
     print(f"   처리 프레임 수: {infer_count}")
-    print(f"   출력 프레임 수: {output_writer.output_frame_count}")
+    print(f"   출력 프레임 수: {output_frame_count}")
     if SAVE_STREAM_OUTPUT and saved_out is not None:
         print(f"   결과 저장 → {STREAM_OUTPUT_PATH}")
-    stream_status_text = {
-        "disabled": "사용 안 함",
-        "start_failed": "시작 실패",
-        "streaming": "종료 시점까지 송출 유지",
-        "disconnected": "중간에 연결 끊김",
-    }[output_writer.stream_status]
-    print(f"   유튜브 송출 상태: {stream_status_text}")
+    print(f"   유튜브 송출 상태: {stream_status_text(stream_status)}")
+    print(f"   세션 폴더: {session_dir}")
 
 
 # ── 진입점 ───────────────────────────────────────────────
