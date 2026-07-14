@@ -51,7 +51,10 @@ PROCESSED_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab
 SAVE_PROCESSED_OUTPUT = False
 PROCESSED_OUTPUT_PATH = "capture_processed_output.mp4"
 
-OUTPUT_STREAM_PRESET = "veryfast"
+STREAM_VIDEO_ENCODER = "h264_nvenc"
+CPU_FALLBACK_VIDEO_ENCODER = "libx264"
+NVENC_PRESET = "p5"
+X264_PRESET = "veryfast"
 RUNTIME_LOG_PATH = "logs/drone_referee_capture_dual.log"
 # ──────────────────────────────────────────────────────────
 
@@ -63,6 +66,70 @@ def _stream_status_text(status):
         "streaming": "송출 중",
         "disconnected": "중간에 연결 끊김",
     }.get(status, status)
+
+
+def pick_stream_bitrate(width, height, fps):
+    pixels = width * height
+    fps_scale = 1.5 if fps > 30.5 else 1.0
+
+    if pixels >= 3840 * 2160:
+        bitrate_mbps = 22.0
+        maxrate_mbps = 28.0
+        cq = 19
+    elif pixels >= 2560 * 1440:
+        bitrate_mbps = 12.0
+        maxrate_mbps = 16.0
+        cq = 20
+    elif pixels >= 1920 * 1080:
+        bitrate_mbps = 8.0
+        maxrate_mbps = 10.0
+        cq = 20
+    elif pixels >= 1280 * 720:
+        bitrate_mbps = 5.0
+        maxrate_mbps = 7.0
+        cq = 21
+    else:
+        bitrate_mbps = 3.0
+        maxrate_mbps = 4.5
+        cq = 22
+
+    bitrate_mbps *= fps_scale
+    maxrate_mbps *= fps_scale
+    bufsize_mbps = bitrate_mbps * 2.0
+
+    return {
+        "b:v": f"{bitrate_mbps:.1f}M",
+        "maxrate": f"{maxrate_mbps:.1f}M",
+        "bufsize": f"{bufsize_mbps:.1f}M",
+        "cq": str(cq),
+    }
+
+
+def build_video_encoder_args(width, height, fps, encoder_name=STREAM_VIDEO_ENCODER):
+    bitrate = pick_stream_bitrate(width, height, fps)
+
+    if encoder_name == "h264_nvenc":
+        return [
+            "-c:v", "h264_nvenc",
+            "-preset", NVENC_PRESET,
+            "-rc", "vbr",
+            "-cq", bitrate["cq"],
+            "-b:v", bitrate["b:v"],
+            "-maxrate", bitrate["maxrate"],
+            "-bufsize", bitrate["bufsize"],
+            "-profile:v", "high",
+            "-pix_fmt", "yuv420p",
+        ], bitrate
+
+    return [
+        "-c:v", CPU_FALLBACK_VIDEO_ENCODER,
+        "-preset", X264_PRESET,
+        "-tune", "zerolatency",
+        "-b:v", bitrate["b:v"],
+        "-maxrate", bitrate["maxrate"],
+        "-bufsize", bitrate["bufsize"],
+        "-pix_fmt", "yuv420p",
+    ], bitrate
 
 
 def start_named_ffmpeg_log_thread(name, proc):
@@ -117,6 +184,7 @@ def start_output_stream_process(name, enabled, rtmp_url, width, height, fps):
         return None, "start_failed"
 
     gop_size = max(1, int(round(fps * 2)))
+    video_args, bitrate = build_video_encoder_args(width, height, fps)
     cmd = [
         "ffmpeg",
         "-loglevel", "error",
@@ -130,13 +198,10 @@ def start_output_stream_process(name, enabled, rtmp_url, width, height, fps):
         "-i", "anullsrc=channel_layout=stereo:sample_rate=44100",
         "-map", "0:v:0",
         "-map", "1:a:0",
-        "-c:v", "libx264",
-        "-preset", OUTPUT_STREAM_PRESET,
-        "-tune", "zerolatency",
+    ] + video_args + [
         "-g", str(gop_size),
         "-keyint_min", str(gop_size),
         "-sc_threshold", "0",
-        "-pix_fmt", "yuv420p",
         "-c:a", "aac",
         "-b:a", "128k",
         "-ar", "44100",
@@ -160,6 +225,10 @@ def start_output_stream_process(name, enabled, rtmp_url, width, height, fps):
         return None, "start_failed"
 
     print(f"📡 {name} 송출 시작 → {rtmp_url}")
+    print(
+        f"   encoder={STREAM_VIDEO_ENCODER}  bitrate={bitrate['b:v']}  "
+        f"maxrate={bitrate['maxrate']}  bufsize={bitrate['bufsize']}  cq={bitrate['cq']}"
+    )
     print(f"   키프레임 간격: 약 {gop_size / fps:.1f}초 ({gop_size} 프레임)")
     start_named_ffmpeg_log_thread(name, proc)
     return proc, "streaming"

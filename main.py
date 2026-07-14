@@ -60,7 +60,7 @@ IMAGE_OUTPUT = "result_images/"
 # OUTPUT_STREAM_RTMP_URL  : 유튜브 라이브 송출 주소
 # SAVE_STREAM_OUTPUT      : 추론된 결과 영상을 로컬 mp4로 저장할지 여부
 # STREAM_OUTPUT_PATH      : 로컬 저장 파일 경로
-INPUT_STREAM_URL       = "https://youtube.com/live/--fQWyY7W-k"
+INPUT_STREAM_URL       = "https://www.youtube.com/watch?v=8arb_a5Z4KQ"
 INPUT_STREAM_FORMAT    = "bestvideo[height<=720]/best[height<=720]/bestvideo/best"
 OUTPUT_STREAM_ENABLED  = True
 OUTPUT_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fsj7"
@@ -76,12 +76,13 @@ SEG_MODEL_PATH  = "model/best_seg_rev03_FP16.engine"
 POSE_MODEL_PATH = "model/best_referee_FP16.engine"
 MAX_WHEELS      = 4
 SHOW_WINDOW     = False
-DRAW_LANE_VIS   = False
+DRAW_LANE_VIS   = True
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
 FRAME_SKIP = 1
 STREAM_READ_TIMEOUT_SEC = 2.0
+STREAM_INPUT_QUEUE_MAX_FRAMES = 120
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -344,6 +345,84 @@ class LatestFrameReader:
                 return self._frame_id, self._frame.copy(), self._fail_count
 
             return last_frame_id, None, self._fail_count
+
+    def stop(self):
+        with self._cond:
+            self._stop = True
+            self._cond.notify_all()
+
+        if self._thread is not None and self._thread.is_alive():
+            self._thread.join(timeout=1.0)
+
+
+class BufferedFrameReader:
+    def __init__(self, cap, max_queue_frames=STREAM_INPUT_QUEUE_MAX_FRAMES):
+        self.cap = cap
+        self.max_queue_frames = max(1, int(max_queue_frames))
+        self._cond = threading.Condition()
+        self._stop = False
+        self._queue = deque()
+        self._frame_id = 0
+        self._fail_count = 0
+        self._thread = None
+
+    def start(self):
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+        return self
+
+    def _run(self):
+        while True:
+            with self._cond:
+                while (
+                    not self._stop
+                    and len(self._queue) >= self.max_queue_frames
+                ):
+                    self._cond.wait(timeout=0.1)
+
+                if self._stop:
+                    return
+
+            ret, frame = self.cap.read()
+
+            with self._cond:
+                if self._stop:
+                    return
+
+                if ret and frame is not None:
+                    self._frame_id += 1
+                    self._queue.append((self._frame_id, frame))
+                    self._fail_count = 0
+                else:
+                    self._fail_count += 1
+                self._cond.notify_all()
+
+            if not ret:
+                time.sleep(0.01)
+
+    def read_next(self, timeout_sec=1.0):
+        deadline = time.time() + timeout_sec
+        with self._cond:
+            while (
+                not self._stop
+                and not self._queue
+                and self._fail_count == 0
+            ):
+                remaining = deadline - time.time()
+                if remaining <= 0:
+                    break
+                self._cond.wait(timeout=remaining)
+
+            if self._queue:
+                frame_id, frame = self._queue.popleft()
+                self._cond.notify_all()
+                return frame_id, frame, self._fail_count
+
+            return 0, None, self._fail_count
+
+    def pending_frames(self):
+        with self._cond:
+            return len(self._queue)
 
     def stop(self):
         with self._cond:
@@ -943,7 +1022,8 @@ def run_rtmp(state):
     output_size = (w, h)
 
     print(f"✅ 스트림 연결 성공: {w}×{h} @ {fps:.1f}fps")
-    print(f"   프레임 스킵: {FRAME_SKIP}\n")
+    print(f"   프레임 스킵: {FRAME_SKIP}")
+    print(f"   입력 버퍼: FIFO {STREAM_INPUT_QUEUE_MAX_FRAMES}프레임\n")
 
     saved_out = None
     if SAVE_STREAM_OUTPUT:
@@ -973,10 +1053,10 @@ def run_rtmp(state):
     if SAVE_STREAM_OUTPUT:
         print(f"   저장 경로: {STREAM_OUTPUT_PATH}")
     print(f"   유튜브 송출: {'ON' if stream_proc else 'OFF'}")
-    print(f"   출력 FPS: {output_fps:.1f} (새 프레임이 늦으면 직전 프레임 유지)\n")
+    print(f"   출력 FPS: {output_fps:.1f} (입력은 순서대로 처리, 지연이 누적될 수 있음)\n")
 
     clahe     = cv2.createCLAHE(clipLimit=CLIP_LIMIT, tileGridSize=TILE_SIZE)
-    frame_reader = LatestFrameReader(cap).start()
+    frame_reader = BufferedFrameReader(cap).start()
     output_writer = RealtimeOutputWriter(
         output_fps,
         saved_out=saved_out,
@@ -992,8 +1072,7 @@ def run_rtmp(state):
 
     try:
         while True:
-            frame_id, frame, reader_fail_cnt = frame_reader.read_latest(
-                last_frame_id,
+            frame_id, frame, reader_fail_cnt = frame_reader.read_next(
                 timeout_sec=STREAM_READ_TIMEOUT_SEC,
             )
             if frame is None:
@@ -1012,7 +1091,7 @@ def run_rtmp(state):
                     cap_fps = cap.get(cv2.CAP_PROP_FPS)
                     if cap_fps and not np.isnan(cap_fps) and cap_fps > 0:
                         fps = cap_fps
-                    frame_reader = LatestFrameReader(cap).start()
+                    frame_reader = BufferedFrameReader(cap).start()
                     last_frame_id = 0
                     last_output_frame_id = 0
                     fail_cnt = 0
@@ -1051,7 +1130,8 @@ def run_rtmp(state):
                     f"  [rtmp] 추론 {fps_ctr.fps():.1f} fps  "
                     f"(frame {fps_ctr.frame_count}, processed={infer_count}, "
                     f"emitted={output_writer.output_frame_count}, "
-                    f"last_repeat={repeat_count}, queue={output_writer.pending_frames()}, "
+                    f"last_repeat={repeat_count}, in_q={frame_reader.pending_frames()}, "
+                    f"out_q={output_writer.pending_frames()}, "
                     f"rss={rss_text}, source={w}x{h})"
                 )
 
