@@ -39,9 +39,9 @@ from violation_tracker import ViolationTracker
 # ──────────────────────────────────────────────────────────
 #  캡처보드 입력 설정
 # ──────────────────────────────────────────────────────────
-CAM_NUM = 0
-CAMERA_WIDTH = 3840
-CAMERA_HEIGHT = 2160
+CAM_NUM = 2
+CAMERA_WIDTH = 1920
+CAMERA_HEIGHT = 1080
 CAMERA_FPS = 30.0
 CAMERA_FOURCC = "MJPG"
 
