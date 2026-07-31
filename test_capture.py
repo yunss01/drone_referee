@@ -6,6 +6,9 @@
 
 import cv2
 
+CAM_NUM = 2     # None으로 두면 자동 탐색 후 가장 큰 인덱스(마지막 카메라)를 사용
+
+
 def find_capture_devices(max_index=5):
     found = []
     for i in range(max_index):
@@ -19,18 +22,22 @@ def find_capture_devices(max_index=5):
 
 
 def main():
-    print("🔍 캡처 장치 탐색 중...")
-    devices = find_capture_devices()
+    if CAM_NUM is not None:
+        cam_index = CAM_NUM
+        print(f"📷 지정된 장치 {cam_index} 번으로 바로 연결합니다.\n")
+    else:
+        print("🔍 캡처 장치 탐색 중...")
+        devices = find_capture_devices()
 
-    if not devices:
-        print("❌ 연결된 캡처 장치를 찾을 수 없습니다.")
-        return
+        if not devices:
+            print("❌ 연결된 캡처 장치를 찾을 수 없습니다.")
+            return
 
-    print(f"✅ 장치 발견: 인덱스 {devices}")
+        print(f"✅ 장치 발견: 인덱스 {devices}")
 
-    # 장치가 여러 개면 가장 큰 번호 (캡처보드일 가능성 높음)
-    cam_index = devices[-1]
-    print(f"📷 장치 {cam_index} 번으로 연결 시도...\n")
+        # 장치가 여러 개면 가장 큰 번호 (캡처보드일 가능성 높음)
+        cam_index = devices[-1]
+        print(f"📷 장치 {cam_index} 번으로 연결 시도...\n")
 
     cap = cv2.VideoCapture(cam_index)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)

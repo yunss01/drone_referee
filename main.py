@@ -91,7 +91,7 @@ DRAW_LANE_VIS   = True # 점선 표시 여부
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
-FRAME_SKIP = 1
+FRAME_SKIP = 2
 
 # ── CSV 로그 설정 (video 모드 전용) ──────────────────────
 SAVE_LOG      = False
@@ -591,7 +591,7 @@ def build_video_encoder_args(width, height, fps, encoder_name=STREAM_VIDEO_ENCOD
 
 def start_output_stream_process(width, height, fps):
     if not OUTPUT_STREAM_ENABLED:
-        return None
+        return None, []
 
     if (
         not OUTPUT_STREAM_RTMP_URL
@@ -599,13 +599,16 @@ def start_output_stream_process(width, height, fps):
     ):
         print("⚠️  OUTPUT_STREAM_ENABLED=True 이지만 OUTPUT_STREAM_RTMP_URL 설정이 비어 있습니다.")
         print("   로컬 저장만 계속 진행합니다.")
-        return None
+        return None, []
 
     # YouTube 권장에 맞춰 2초 간격으로 키프레임을 고정한다.
     gop_size = max(1, int(round(fps * 2)))
     video_args, bitrate = build_video_encoder_args(width, height, fps)
 
-    cmd = [
+    # 1) 로컬 인코딩 전용 프로세스. 네트워크에는 전혀 관여하지 않고
+    #    python이 보내는 raw 프레임을 인코딩/먹싱해서 로컬 파이프(pipe:1)로만 내보낸다.
+    #    -> 이 프로세스의 stdin은 절대 네트워크 때문에 막히지 않는다.
+    encode_cmd = [
         "ffmpeg",
         "-loglevel", "error",
         "-y",
@@ -626,33 +629,82 @@ def start_output_stream_process(width, height, fps):
         "-b:a", "128k",
         "-ar", "44100",
         "-shortest",
-        "-f", "flv",
-        OUTPUT_STREAM_RTMP_URL,
+        "-f", "mpegts",
+        "pipe:1",
     ]
 
     try:
-        proc = subprocess.Popen(
-            cmd,
+        encode_proc = subprocess.Popen(
+            encode_cmd,
             stdin=subprocess.PIPE,
-            stdout=subprocess.DEVNULL,
+            stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
         print("⚠️  ffmpeg를 찾을 수 없습니다. 로컬 저장만 계속 진행합니다.")
-        return None
+        return None, []
     except Exception as e:
-        print(f"⚠️  라이브 송출 시작 실패: {e}")
+        print(f"⚠️  라이브 송출 인코더 시작 실패: {e}")
         print("   로컬 저장만 계속 진행합니다.")
-        return None
+        return None, []
 
-    print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL}")
+    start_ffmpeg_log_thread(encode_proc, name="ffmpeg:output-encode")
+
+    # 2) mbuffer로 완충한 뒤 3) 별도 프로세스가 실제 RTMP 송출을 담당한다.
+    #    RTMP write가 느려지거나 멈춰도 mbuffer가 그 사이를 흡수하므로
+    #    encode_proc(=python이 stdin.write로 프레임을 넣는 대상)는 막히지 않는다.
+    try:
+        mbuf_proc = subprocess.Popen(
+            ["mbuffer", "-q", "-m", "128M"],
+            stdin=encode_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("⚠️  mbuffer가 설치되어 있지 않습니다. (sudo apt install mbuffer)")
+        print("   유튜브 송출 없이 로컬 저장만 계속 진행합니다.")
+        encode_proc.kill()
+        return None, []
+    except Exception as e:
+        print(f"⚠️  mbuffer 시작 실패: {e}")
+        encode_proc.kill()
+        return None, []
+
+    encode_proc.stdout.close()
+
+    try:
+        push_proc = subprocess.Popen(
+            [
+                "ffmpeg", "-loglevel", "error",
+                "-f", "mpegts", "-i", "pipe:0",
+                "-c", "copy", "-f", "flv",
+                OUTPUT_STREAM_RTMP_URL,
+            ],
+            stdin=mbuf_proc.stdout,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
+        print("⚠️  ffmpeg를 찾을 수 없어 송출 relay를 시작하지 못했습니다.")
+        mbuf_proc.kill()
+        encode_proc.kill()
+        return None, []
+    except Exception as e:
+        print(f"⚠️  송출 relay 시작 실패: {e}")
+        mbuf_proc.kill()
+        encode_proc.kill()
+        return None, []
+
+    mbuf_proc.stdout.close()
+    start_ffmpeg_log_thread(push_proc, name="ffmpeg:output-push")
+
+    print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL} (mbuffer 128MB 완충)")
     print(
         f"   encoder={STREAM_VIDEO_ENCODER}  bitrate={bitrate['b:v']}  "
         f"maxrate={bitrate['maxrate']}  bufsize={bitrate['bufsize']}  cq={bitrate['cq']}"
     )
     print(f"   키프레임 간격: 약 {gop_size / fps:.1f}초 ({gop_size} 프레임)")
-    start_ffmpeg_log_thread(proc)
-    return proc
+    return encode_proc, [mbuf_proc, push_proc]
 
 
 def stop_stream_process(proc):
@@ -700,7 +752,9 @@ def build_spool_record_command(stream_url, segments_dir):
         "-y",
         "-reconnect", "1",
         "-reconnect_streamed", "1",
+        "-reconnect_at_eof", "1",
         "-reconnect_delay_max", "5",
+        "-rw_timeout", "15000000",
         "-fflags", "+genpts",
         "-i", stream_url,
         "-map", "0:v:0",
@@ -752,7 +806,7 @@ def list_processable_segments(segments_dir, markers_dir, recorder_alive):
         if name.startswith("input_") and name.endswith(".mkv")
     )
 
-    if recorder_alive and len(segment_files) > 1:
+    if recorder_alive:
         candidates = segment_files[:-1]
     else:
         candidates = segment_files
@@ -969,6 +1023,7 @@ def run_rtmp(state):
 
     saved_out = None
     stream_proc = None
+    stream_relay_procs = []
     stream_status = "disabled"
     output_size = None
     output_fps = 0.0
@@ -1045,7 +1100,7 @@ def run_rtmp(state):
                             saved_out.release()
                             saved_out = None
 
-                    stream_proc = start_output_stream_process(
+                    stream_proc, stream_relay_procs = start_output_stream_process(
                         output_size[0],
                         output_size[1],
                         output_fps,
@@ -1101,7 +1156,10 @@ def run_rtmp(state):
                         except (BrokenPipeError, OSError):
                             print("⚠️  유튜브 송출 연결이 끊겼습니다. 로컬 저장만 계속 진행합니다.")
                             stop_stream_process(stream_proc)
+                            for relay_proc in stream_relay_procs:
+                                stop_stream_process(relay_proc)
                             stream_proc = None
+                            stream_relay_procs = []
                             stream_status = "disconnected"
 
                     output_frame_count += 1
@@ -1163,6 +1221,8 @@ def run_rtmp(state):
             stop_stream_process(recorder_proc)
         if stream_proc is not None:
             stop_stream_process(stream_proc)
+            for relay_proc in stream_relay_procs:
+                stop_stream_process(relay_proc)
             stream_proc = None
         if saved_out:
             saved_out.release()

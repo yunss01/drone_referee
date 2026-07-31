@@ -738,7 +738,7 @@ def marker_path_for(segment_path, markers_dir):
 def list_processable_segments(segments_dir, markers_dir, recorder_alive):
     segment_files = list_segment_files(segments_dir)
 
-    if recorder_alive and len(segment_files) > 1:
+    if recorder_alive:
         candidates = segment_files[:-1]
     else:
         candidates = segment_files
@@ -853,8 +853,11 @@ def build_camera_spool_command(segments_dir):
             print("   입력 세그먼트 저장만 계속 진행합니다.")
             raw_status = "start_failed"
         else:
-            tee_outputs.append(f"[f=flv:onfail=ignore]{RAW_STREAM_RTMP_URL}")
-            raw_status = "streaming"
+            # RTMP를 tee에서 직접 물지 않고 pipe:1로만 내보낸다.
+            # 실제 유튜브 송출은 별도 프로세스(mbuffer + ffmpeg)가 담당해서
+            # 네트워크가 느려져도 이 레코더(디스크 세그먼트 저장)가 막히지 않게 한다.
+            tee_outputs.append("[f=mpegts]pipe:1")
+            raw_status = "pending"
 
     if SAVE_RAW_OUTPUT:
         tee_outputs.append(
@@ -910,22 +913,84 @@ def build_camera_spool_command(segments_dir):
     return cmd, raw_status, bitrate, gop_size
 
 
-def start_camera_spool_recorder(segments_dir):
-    cmd, raw_status, bitrate, gop_size = build_camera_spool_command(segments_dir)
+def start_raw_stream_relay(recorder_proc):
+    """recorder_proc의 stdout(mpegts pipe)을 mbuffer로 완충한 뒤
+    별도 ffmpeg 프로세스로 유튜브에 송출한다.
+    RTMP 쓰기가 느려지거나 멈춰도 mbuffer가 그 사이를 흡수하므로
+    recorder_proc(디스크 세그먼트 저장)는 영향을 받지 않는다.
+    """
+    if recorder_proc.stdout is None:
+        return [], "start_failed"
 
     try:
-        proc = subprocess.Popen(
-            cmd,
-            stdin=subprocess.DEVNULL,
+        mbuf_proc = subprocess.Popen(
+            ["mbuffer", "-q", "-m", "128M"],
+            stdin=recorder_proc.stdout,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+        )
+    except FileNotFoundError:
+        print("⚠️  mbuffer가 설치되어 있지 않습니다. (sudo apt install mbuffer)")
+        print("   원본 송출은 건너뜁니다. 디스크 저장/추론은 영향받지 않습니다.")
+        return [], "start_failed"
+    except Exception as e:
+        print(f"⚠️  mbuffer 시작 실패: {e}")
+        return [], "start_failed"
+
+    # 부모가 recorder_proc.stdout을 계속 들고 있으면 mbuffer가 EOF를
+    # 못 받을 수 있어 여기서 닫는다 (mbuf_proc이 유일한 리더가 됨).
+    recorder_proc.stdout.close()
+
+    try:
+        push_proc = subprocess.Popen(
+            [
+                "ffmpeg", "-loglevel", "error",
+                "-f", "mpegts", "-i", "pipe:0",
+                "-c", "copy", "-f", "flv",
+                RAW_STREAM_RTMP_URL,
+            ],
+            stdin=mbuf_proc.stdout,
             stdout=subprocess.DEVNULL,
             stderr=subprocess.PIPE,
         )
     except FileNotFoundError:
+        print("⚠️  ffmpeg를 찾을 수 없어 원본 송출 relay를 시작하지 못했습니다.")
+        mbuf_proc.kill()
+        return [mbuf_proc], "start_failed"
+    except Exception as e:
+        print(f"⚠️  원본 송출 relay 시작 실패: {e}")
+        mbuf_proc.kill()
+        return [mbuf_proc], "start_failed"
+
+    mbuf_proc.stdout.close()
+    start_named_ffmpeg_log_thread("raw-push", push_proc)
+
+    time.sleep(0.5)
+    relay_procs = [mbuf_proc, push_proc]
+    if push_proc.poll() is not None or mbuf_proc.poll() is not None:
+        print("⚠️  원본 송출 relay가 시작 직후 종료되었습니다.")
+        return relay_procs, "start_failed"
+
+    return relay_procs, "streaming"
+
+
+def start_camera_spool_recorder(segments_dir):
+    cmd, raw_status, bitrate, gop_size = build_camera_spool_command(segments_dir)
+
+    needs_pipe = raw_status == "pending"
+    try:
+        proc = subprocess.Popen(
+            cmd,
+            stdin=subprocess.DEVNULL,
+            stdout=subprocess.PIPE if needs_pipe else subprocess.DEVNULL,
+            stderr=subprocess.PIPE,
+        )
+    except FileNotFoundError:
         print("❌ ffmpeg를 찾을 수 없습니다.")
-        return None, "start_failed"
+        return None, "start_failed", []
     except Exception as e:
         print(f"❌ 캡처 입력 스풀 레코더 시작 실패: {e}")
-        return None, "start_failed"
+        return None, "start_failed", []
 
     print(f"📼 캡처 입력 스풀 시작 → /dev/video{CAM_NUM}")
     print(
@@ -943,10 +1008,6 @@ def start_camera_spool_recorder(segments_dir):
         f"   입력 세그먼트 최종 보존: {'ON' if KEEP_INPUT_SEGMENTS else 'OFF'} "
         f"(처리 후 삭제: {'ON' if DELETE_INPUT_SEGMENTS_AFTER_PROCESS else 'OFF'})"
     )
-    if RAW_STREAM_ENABLED:
-        print(f"   원본 송출 상태: {_stream_status_text(raw_status)}")
-        if raw_status == "streaming":
-            print(f"   원본 송출 주소: {RAW_STREAM_RTMP_URL}")
     if SAVE_RAW_OUTPUT:
         print(f"   원본 저장 경로: {RAW_OUTPUT_PATH}")
     start_named_ffmpeg_log_thread("capture-spool", proc)
@@ -955,9 +1016,18 @@ def start_camera_spool_recorder(segments_dir):
     if proc.poll() is not None:
         print("❌ 캡처 입력 스풀 레코더가 시작 직후 종료되었습니다.")
         print("   런타임 로그와 ffmpeg stderr 로그를 확인해 주세요.")
-        return None, "start_failed"
+        return None, "start_failed", []
 
-    return proc, raw_status
+    relay_procs = []
+    if needs_pipe:
+        relay_procs, raw_status = start_raw_stream_relay(proc)
+
+    if RAW_STREAM_ENABLED:
+        print(f"   원본 송출 상태: {_stream_status_text(raw_status)}")
+        if raw_status == "streaming":
+            print(f"   원본 송출 주소: {RAW_STREAM_RTMP_URL} (mbuffer 128MB 완충)")
+
+    return proc, raw_status, relay_procs
 
 
 def run_camera_dual_stream(state):
@@ -972,7 +1042,7 @@ def run_camera_dual_stream(state):
     session_dir, segments_dir, markers_dir = make_spool_session_dirs()
     print(f"📁 세션 폴더: {session_dir}")
 
-    recorder_proc, raw_status = start_camera_spool_recorder(segments_dir)
+    recorder_proc, raw_status, raw_relay_procs = start_camera_spool_recorder(segments_dir)
     if recorder_proc is None:
         return
 
@@ -1170,6 +1240,9 @@ def run_camera_dual_stream(state):
     finally:
         if recorder_proc.poll() is None:
             stop_named_stream_process("capture-spool", recorder_proc)
+        for relay_proc in raw_relay_procs:
+            if relay_proc.poll() is None:
+                stop_named_stream_process("raw-relay", relay_proc)
         if stream_proc is not None:
             stop_named_stream_process("processed", stream_proc)
         if saved_out is not None:
