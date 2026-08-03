@@ -24,6 +24,7 @@ import signal
 import atexit
 import traceback
 import faulthandler
+from collections import deque
 import numpy as np
 from ultralytics import YOLO
 
@@ -59,7 +60,7 @@ IMAGE_OUTPUT = "result_images/"
 # OUTPUT_STREAM_RTMP_URL  : 유튜브 라이브 송출 주소
 # SAVE_STREAM_OUTPUT      : 추론된 결과 영상을 로컬 mp4로 저장할지 여부
 # STREAM_OUTPUT_PATH      : 로컬 저장 파일 경로
-INPUT_STREAM_URL       = "https://youtube.com/live/--fQWyY7W-k" # 드론 영상 유튜브 라이크 링크
+INPUT_STREAM_URL       = "https://youtube.com/live/--fQWyY7W-k" # 드론 영상 유튜브 라이브 링크
 INPUT_STREAM_FORMAT    = (
     "bestvideo[height<=1080][vcodec*=avc1]/"
     "best[height<=1080][vcodec*=avc1]/"
@@ -75,6 +76,19 @@ SPOOL_SEGMENT_SECONDS  = 10
 KEEP_INPUT_SEGMENTS    = False
 DELETE_INPUT_SEGMENTS_AFTER_PROCESS = True
 SPOOL_POLL_INTERVAL_SEC = 0.5
+
+# RTMP relay 설정 (디스크 스풀 송출 + 자동 재연결)
+# 이 시스템의 유튜브 라이브는 실시간 시청용이 아니라 나중에 확인하는 아카이브다.
+# 따라서 지연이 생기더라도 한 프레임도 버리지 않는 것이 최우선이다.
+RTMP_SPOOL_PART_MB = 4
+RTMP_SPOOL_WARN_GB = 20
+RTMP_RECONNECT_DELAY_SEC = 3.0
+RTMP_RELAY_CHUNK_BYTES = 188 * 64
+# 종료 시 남은 송출 대기분을 끝까지 보낼지 여부.
+# True면 Ctrl+C 후에도 스풀을 다 비울 때까지 송출을 계속한다.
+# (그 동안 Ctrl+C를 한 번 더 누르면 강제 종료)
+DRAIN_SPOOL_ON_EXIT = True
+
 STREAM_VIDEO_ENCODER   = "h264_nvenc"
 CPU_FALLBACK_VIDEO_ENCODER = "libx264"
 NVENC_PRESET           = "p5"
@@ -191,6 +205,11 @@ def setup_runtime_logging():
             signame = f"SIG{signum}"
         print(f"\n[시그널] {signame}({signum}) 수신", flush=True)
         record_exit(f"signal {signame}({signum})")
+        # SIGINT는 KeyboardInterrupt로 올려보내 정상 종료 절차(남은 송출
+        # 대기분 전송)를 타게 한다. 그 단계에서 Ctrl+C를 한 번 더 누르면
+        # 그때는 강제 종료된다.
+        if signum == getattr(signal, "SIGINT", None):
+            raise KeyboardInterrupt
         raise SystemExit(128 + signum)
 
     for signame in ("SIGTERM", "SIGINT", "SIGHUP", "SIGABRT"):
@@ -589,9 +608,456 @@ def build_video_encoder_args(width, height, fps, encoder_name=STREAM_VIDEO_ENCOD
     ], bitrate
 
 
-def start_output_stream_process(width, height, fps):
+def stop_named_stream_process(name, proc):
+    """DiskSpoolRelay가 쓰는 인터페이스. main.py의 stop_stream_process 래퍼."""
+    if proc is None:
+        return
+    try:
+        if proc.stdin:
+            proc.stdin.close()
+    except Exception:
+        pass
+    try:
+        proc.wait(timeout=5)
+        print(f"[ffmpeg:{name}] stop 후 종료 code={proc.returncode}")
+    except Exception:
+        print(f"[ffmpeg:{name}] stop timeout -> kill()")
+        proc.kill()
+
+
+def start_named_ffmpeg_log_thread(name, proc):
+    start_ffmpeg_log_thread(proc, name=f"ffmpeg:{name}")
+
+
+class DiskSpoolRelay:
+    """mpegts 바이트 스트림을 디스크에 스풀하면서 RTMP로 송출한다.
+
+    구조:  상류 ffmpeg -> [writer 스레드] -> 디스크 스풀 파트 파일
+                       -> [sender 스레드] -> ffmpeg push -> RTMP
+
+    설계 원칙 (이 시스템은 실시간 시청용이 아니라 아카이브용 라이브):
+    - 한 프레임도 버리지 않는다. 네트워크가 느리면 지연될 뿐, 유실은 없다.
+    - 상류(디스크 녹화/인코딩)는 네트워크 상태와 무관하게 절대 블로킹되지 않는다.
+    - push가 죽으면 자동 재연결하고, 현재 파트를 처음부터 다시 보내
+      파이프/소켓에 남아 사라졌을 수 있는 구간까지 확실히 재전송한다.
+      (유실보다 약간의 중복이 낫다)
+    - 전송이 끝난 파트 파일은 즉시 삭제해 디스크를 회수한다.
+    """
+
+    def __init__(self, name, source_stream, rtmp_url, spool_dir,
+                 part_bytes=None, reconnect_delay=None):
+        self.name = name
+        self.source = source_stream
+        self.rtmp_url = rtmp_url
+        self.spool_dir = spool_dir
+        self.part_bytes = part_bytes or (RTMP_SPOOL_PART_MB * 1024 * 1024)
+        self.reconnect_delay = reconnect_delay or RTMP_RECONNECT_DELAY_SEC
+
+        os.makedirs(self.spool_dir, exist_ok=True)
+
+        self._stopping = threading.Event()      # 즉시 중단(강제 종료)
+        self._source_done = threading.Event()   # 상류 입력 종료
+        self._sender_done = threading.Event()   # 스풀을 전부 송출 완료
+        self._lock = threading.Lock()
+
+        self._write_index = 0        # writer가 쓰고 있는 파트 번호
+        self._send_index = 0         # sender가 보내고 있는 파트 번호
+        self._written_bytes = 0      # 누적 스풀 기록량
+        self._sent_bytes = 0         # 누적 전송 완료량
+        self._push_proc = None
+        self._threads = []
+        self._warned_backlog = False
+
+        self.reconnect_count = 0
+        self.status = "pending"
+
+    # ── 외부 API ──────────────────────────────────────────
+    def start(self):
+        proc = self._spawn_push()
+        if proc is None:
+            self.status = "start_failed"
+            return False
+
+        self._push_proc = proc
+        self.status = "streaming"
+
+        for target, tname in (
+            (self._writer_loop, f"{self.name}-spool"),
+            (self._sender_loop, f"{self.name}-sender"),
+        ):
+            t = threading.Thread(target=target, name=tname, daemon=True)
+            t.start()
+            self._threads.append(t)
+        return True
+
+    def pending_bytes(self):
+        """아직 유튜브로 못 보낸 분량(바이트)."""
+        with self._lock:
+            return max(0, self._written_bytes - self._sent_bytes)
+
+    def close_source(self):
+        """상류 입력만 닫는다. 이미 스풀된 분량은 계속 송출된다."""
+        try:
+            self.source.close()
+        except Exception:
+            pass
+
+    def drain(self, progress_cb=None, poll_sec=2.0):
+        """남은 스풀을 전부 송출할 때까지 대기한다.
+        상류 ffmpeg는 호출 전에 이미 종료되어 있어야 한다(그래야 EOF가 온다).
+        progress_cb(pending_bytes)가 주어지면 주기적으로 호출한다.
+        """
+        while not self._stopping.is_set():
+            if self._sender_done.is_set():
+                break
+            if progress_cb is not None:
+                progress_cb(self.pending_bytes())
+            time.sleep(poll_sec)
+
+    def stop(self):
+        self._stopping.set()
+        self.close_source()
+        for t in self._threads:
+            t.join(timeout=3)
+
+        proc = self._push_proc
+        self._push_proc = None
+        if proc is not None:
+            stop_named_stream_process(f"{self.name}-push", proc)
+
+        self._cleanup_spool()
+
+    def summary(self):
+        pending_mb = self.pending_bytes() / (1024 * 1024)
+        sent_mb = self._sent_bytes / (1024 * 1024)
+        return (
+            f"전송 {sent_mb:.0f}MB, 미전송 {pending_mb:.1f}MB, "
+            f"재연결 {self.reconnect_count}회"
+        )
+
+    # ── 내부 구현 ─────────────────────────────────────────
+    def _part_path(self, index):
+        return os.path.join(self.spool_dir, f"part_{index:08d}.ts")
+
+    def _spawn_push(self):
+        try:
+            return subprocess.Popen(
+                [
+                    "ffmpeg", "-loglevel", "error",
+                    "-f", "mpegts", "-i", "pipe:0",
+                    "-c", "copy", "-f", "flv",
+                    self.rtmp_url,
+                ],
+                stdin=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.PIPE,
+            )
+        except FileNotFoundError:
+            print(f"⚠️  ffmpeg를 찾을 수 없어 {self.name} 송출을 시작하지 못했습니다.")
+            return None
+        except Exception as e:
+            print(f"⚠️  {self.name} 송출 프로세스 시작 실패: {e}")
+            return None
+
+    def _writer_loop(self):
+        """상류에서 계속 읽어 디스크 파트 파일로 쌓는다.
+        네트워크와 완전히 무관하므로 상류가 막히는 일이 없다.
+        """
+        f = None
+        part_written = 0
+        try:
+            while not self._stopping.is_set():
+                chunk = self.source.read(RTMP_RELAY_CHUNK_BYTES)
+                if not chunk:
+                    break
+
+                if f is None:
+                    f = open(self._part_path(self._write_index), "wb")
+                    part_written = 0
+
+                f.write(chunk)
+                f.flush()
+                part_written += len(chunk)
+                with self._lock:
+                    self._written_bytes += len(chunk)
+
+                if part_written >= self.part_bytes:
+                    f.close()
+                    f = None
+                    with self._lock:
+                        self._write_index += 1
+
+                self._check_backlog()
+        except Exception as e:
+            if not self._stopping.is_set():
+                print(f"⚠️  {self.name} 스풀 기록 종료: {e}")
+        finally:
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            with self._lock:
+                # 마지막 파트도 sender가 넘어갈 수 있도록 인덱스를 진행시킨다.
+                self._write_index += 1
+            self._source_done.set()
+
+    def _check_backlog(self):
+        pending = self.pending_bytes()
+        warn_bytes = RTMP_SPOOL_WARN_GB * 1024 * 1024 * 1024
+        if pending >= warn_bytes and not self._warned_backlog:
+            self._warned_backlog = True
+            print(
+                f"⚠️  {self.name} 송출 대기분이 {pending / (1024**3):.1f}GB를 넘었습니다. "
+                f"네트워크 업로드가 계속 부족한 상태입니다."
+            )
+        elif pending < warn_bytes / 2:
+            self._warned_backlog = False
+
+    def _sender_loop(self):
+        """파트 파일을 순서대로 push로 흘린다. 전송 끝난 파트는 삭제."""
+        f = None
+        try:
+            while not self._stopping.is_set():
+                if f is None:
+                    path = self._part_path(self._send_index)
+                    if not os.path.exists(path):
+                        if self._source_done.is_set():
+                            with self._lock:
+                                if self._send_index >= self._write_index:
+                                    return
+                        time.sleep(0.05)
+                        continue
+                    f = open(path, "rb")
+
+                chunk = f.read(RTMP_RELAY_CHUNK_BYTES)
+
+                if not chunk:
+                    # 이 파트를 다 읽었다. 다음 파트가 있으면 넘어간다.
+                    with self._lock:
+                        part_complete = self._send_index < self._write_index
+                        source_done = self._source_done.is_set()
+                    if part_complete or source_done:
+                        f.close()
+                        f = None
+                        try:
+                            os.remove(self._part_path(self._send_index))
+                        except OSError:
+                            pass
+                        self._send_index += 1
+                        continue
+                    # 아직 상류가 이 파트에 더 쓰는 중 -> 잠깐 기다렸다 재시도
+                    time.sleep(0.05)
+                    continue
+
+                if not self._ensure_push_alive():
+                    if self._stopping.is_set():
+                        return
+                    # 재연결 실패 -> 현재 파트를 처음부터 다시 보낸다.
+                    f.seek(0)
+                    continue
+
+                proc = self._push_proc
+                if proc is None or proc.stdin is None:
+                    continue
+                try:
+                    proc.stdin.write(chunk)
+                    with self._lock:
+                        self._sent_bytes += len(chunk)
+                except (BrokenPipeError, OSError, ValueError, AttributeError):
+                    print(f"⚠️  {self.name} 송출 연결이 끊겼습니다. 재연결 후 이어서 보냅니다.")
+                    self._kill_push()
+                    # 파이프/소켓에 남아 사라졌을 수 있는 구간까지 확실히
+                    # 재전송하기 위해 현재 파트를 처음부터 다시 보낸다.
+                    with self._lock:
+                        self._sent_bytes -= f.tell()
+                    f.seek(0)
+        except Exception as e:
+            if not self._stopping.is_set():
+                print(f"⚠️  {self.name} 송출 스레드 종료: {e}")
+        finally:
+            if f is not None:
+                try:
+                    f.close()
+                except Exception:
+                    pass
+            self._sender_done.set()
+
+    def _ensure_push_alive(self):
+        proc = self._push_proc
+        if proc is not None and proc.poll() is None:
+            return True
+
+        if proc is not None:
+            print(
+                f"⚠️  {self.name} 송출 프로세스가 종료되었습니다 "
+                f"(code={proc.returncode}). {self.reconnect_delay:.0f}초 후 재연결합니다."
+            )
+            self._kill_push()
+
+        if self._stopping.wait(timeout=self.reconnect_delay):
+            return False
+
+        new_proc = self._spawn_push()
+        if new_proc is None:
+            self.status = "disconnected"
+            return False
+
+        self._push_proc = new_proc
+        self.reconnect_count += 1
+        self.status = "streaming"
+        start_named_ffmpeg_log_thread(f"{self.name}-push", new_proc)
+        print(f"🔁 {self.name} 송출 재연결 완료 (누적 {self.reconnect_count}회)")
+        return True
+
+    def _kill_push(self):
+        proc = self._push_proc
+        self._push_proc = None
+        if proc is None:
+            return
+        # 순서 주의: 다른 스레드가 stdin에 write 중일 수 있으므로
+        # 프로세스를 먼저 죽여 그 write가 EPIPE로 풀리게 한 뒤 닫는다.
+        # (반대로 하면 write 중인 파일 객체를 닫게 되어 데드락이 난다)
+        try:
+            proc.kill()
+        except Exception:
+            pass
+        try:
+            if proc.stdin:
+                proc.stdin.close()
+        except Exception:
+            pass
+
+    def _cleanup_spool(self):
+        """남은 파트 파일 정리. 미전송분이 있으면 남겨두고 경로를 알린다."""
+        try:
+            remaining = [
+                name for name in os.listdir(self.spool_dir)
+                if name.startswith("part_") and name.endswith(".ts")
+            ]
+        except OSError:
+            return
+
+        if remaining and not self._sender_done.is_set():
+            left = sum(
+                os.path.getsize(os.path.join(self.spool_dir, n))
+                for n in remaining
+            )
+            print(
+                f"⚠️  {self.name} 미전송 {left / (1024**2):.1f}MB가 남았습니다. "
+                f"스풀 보존: {self.spool_dir}"
+            )
+            return
+
+        try:
+            for name in remaining:
+                os.remove(os.path.join(self.spool_dir, name))
+            os.rmdir(self.spool_dir)
+        except OSError:
+            pass
+
+
+def drain_relays_on_exit(*relays):
+    """종료 요청 후에도 남은 송출 대기분을 끝까지 밀어낸다.
+    이 시스템의 라이브는 아카이브 용도이므로, 이미 촬영/처리된 분량은
+    시간이 걸리더라도 전부 유튜브로 올려야 한다.
+    이 대기 중 Ctrl+C를 한 번 더 누르면 강제 종료된다.
+    """
+    active = [r for r in relays if r is not None and r.pending_bytes() > 0]
+    if not active:
+        return
+
+    total_mb = sum(r.pending_bytes() for r in active) / (1024 * 1024)
+    print("\n" + "─" * 60)
+    print(f"📤 남은 송출 대기분 {total_mb:.1f}MB를 마저 보내는 중입니다.")
+    print("   유튜브 업로드가 끝날 때까지 프로그램을 유지합니다.")
+    print("   (강제 종료하려면 Ctrl+C를 한 번 더 누르세요)")
+    print("─" * 60)
+
+    started_at = time.time()
+    last_report = 0.0
+    last_pending = None
+    stalled_since = None
+
+    try:
+        while True:
+            # 완료 판정은 sender 스레드의 정상 종료(_sender_done)로 한다.
+            # 바이트 누계는 재전송 때문에 오차가 남을 수 있어 기준으로 못 쓴다.
+            if all(r._sender_done.is_set() for r in active):
+                break
+
+            pending_map = {r.name: r.pending_bytes() for r in active}
+            pending_total = sum(pending_map.values())
+
+            # 송출 스레드가 정상 완료(_sender_done)가 아닌 채로 죽었다면
+            # 더 보낼 방법이 없으므로 중단한다.
+            stuck = [
+                r for r in active
+                if not r._sender_done.is_set()
+                and not any(
+                    t.is_alive() for t in r._threads
+                    if t.name.endswith("-sender")
+                )
+            ]
+            if stuck:
+                names = ", ".join(r.name for r in stuck)
+                print(f"⚠️  {names} 송출 스레드가 중단되어 남은 분량을 보낼 수 없습니다.")
+                break
+
+            now = time.time()
+            if now - last_report >= 5.0:
+                elapsed = now - started_at
+                detail = ", ".join(
+                    f"{name} {b / (1024 * 1024):.1f}MB"
+                    for name, b in pending_map.items()
+                )
+                if last_pending is not None and elapsed > 0:
+                    drained = last_pending - pending_total
+                    rate = drained / max(1e-6, now - last_report)
+                    if rate > 1024:
+                        eta_sec = pending_total / rate
+                        eta = f", 예상 {eta_sec / 60:.1f}분 남음"
+                    else:
+                        eta = ", 진행 없음(네트워크 확인 필요)"
+                else:
+                    eta = ""
+                print(f"   [송출 대기] {detail}{eta}")
+
+                if last_pending is not None and pending_total >= last_pending:
+                    stalled_since = stalled_since or now
+                    if now - stalled_since >= 120:
+                        print(
+                            "⚠️  2분 넘게 전송이 진행되지 않고 있습니다. "
+                            "네트워크를 확인하거나 Ctrl+C로 종료하세요."
+                        )
+                        stalled_since = now
+                else:
+                    stalled_since = None
+
+                last_pending = pending_total
+                last_report = now
+
+            time.sleep(1.0)
+    except KeyboardInterrupt:
+        remain = sum(r.pending_bytes() for r in active) / (1024 * 1024)
+        print(f"\n[강제 종료] 미전송 {remain:.1f}MB가 남았습니다.")
+        return
+
+    print("✅ 남은 송출 대기분을 모두 전송했습니다.")
+
+
+def start_output_stream_process(width, height, fps, spool_dir):
+    """처리 결과를 유튜브로 송출한다.
+
+    구조: python(프레임) -> 인코딩 전용 ffmpeg(mpegts, pipe:1)
+                          -> DiskSpoolRelay(디스크 스풀 + 자동 재연결) -> RTMP
+
+    python이 stdin.write로 프레임을 넣는 대상은 네트워크와 무관한
+    로컬 인코더뿐이므로, 업로드가 느려져도 추론 루프가 블로킹되지 않는다.
+    송출 대기분은 디스크에 쌓여 한 프레임도 유실되지 않는다.
+    """
     if not OUTPUT_STREAM_ENABLED:
-        return None, []
+        return None, None, "disabled"
 
     if (
         not OUTPUT_STREAM_RTMP_URL
@@ -599,15 +1065,12 @@ def start_output_stream_process(width, height, fps):
     ):
         print("⚠️  OUTPUT_STREAM_ENABLED=True 이지만 OUTPUT_STREAM_RTMP_URL 설정이 비어 있습니다.")
         print("   로컬 저장만 계속 진행합니다.")
-        return None, []
+        return None, None, "start_failed"
 
     # YouTube 권장에 맞춰 2초 간격으로 키프레임을 고정한다.
     gop_size = max(1, int(round(fps * 2)))
     video_args, bitrate = build_video_encoder_args(width, height, fps)
 
-    # 1) 로컬 인코딩 전용 프로세스. 네트워크에는 전혀 관여하지 않고
-    #    python이 보내는 raw 프레임을 인코딩/먹싱해서 로컬 파이프(pipe:1)로만 내보낸다.
-    #    -> 이 프로세스의 stdin은 절대 네트워크 때문에 막히지 않는다.
     encode_cmd = [
         "ffmpeg",
         "-loglevel", "error",
@@ -642,69 +1105,31 @@ def start_output_stream_process(width, height, fps):
         )
     except FileNotFoundError:
         print("⚠️  ffmpeg를 찾을 수 없습니다. 로컬 저장만 계속 진행합니다.")
-        return None, []
+        return None, None, "start_failed"
     except Exception as e:
         print(f"⚠️  라이브 송출 인코더 시작 실패: {e}")
         print("   로컬 저장만 계속 진행합니다.")
-        return None, []
+        return None, None, "start_failed"
 
-    start_ffmpeg_log_thread(encode_proc, name="ffmpeg:output-encode")
+    start_named_ffmpeg_log_thread("output-encode", encode_proc)
 
-    # 2) mbuffer로 완충한 뒤 3) 별도 프로세스가 실제 RTMP 송출을 담당한다.
-    #    RTMP write가 느려지거나 멈춰도 mbuffer가 그 사이를 흡수하므로
-    #    encode_proc(=python이 stdin.write로 프레임을 넣는 대상)는 막히지 않는다.
-    try:
-        mbuf_proc = subprocess.Popen(
-            ["mbuffer", "-q", "-m", "128M"],
-            stdin=encode_proc.stdout,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.DEVNULL,
-        )
-    except FileNotFoundError:
-        print("⚠️  mbuffer가 설치되어 있지 않습니다. (sudo apt install mbuffer)")
-        print("   유튜브 송출 없이 로컬 저장만 계속 진행합니다.")
+    relay = DiskSpoolRelay("처리본", encode_proc.stdout,
+                           OUTPUT_STREAM_RTMP_URL, spool_dir)
+    if not relay.start():
+        print("⚠️  송출 relay 시작 실패. 로컬 저장만 계속 진행합니다.")
         encode_proc.kill()
-        return None, []
-    except Exception as e:
-        print(f"⚠️  mbuffer 시작 실패: {e}")
-        encode_proc.kill()
-        return None, []
+        return None, None, "start_failed"
 
-    encode_proc.stdout.close()
+    start_named_ffmpeg_log_thread("output-push", relay._push_proc)
 
-    try:
-        push_proc = subprocess.Popen(
-            [
-                "ffmpeg", "-loglevel", "error",
-                "-f", "mpegts", "-i", "pipe:0",
-                "-c", "copy", "-f", "flv",
-                OUTPUT_STREAM_RTMP_URL,
-            ],
-            stdin=mbuf_proc.stdout,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.PIPE,
-        )
-    except FileNotFoundError:
-        print("⚠️  ffmpeg를 찾을 수 없어 송출 relay를 시작하지 못했습니다.")
-        mbuf_proc.kill()
-        encode_proc.kill()
-        return None, []
-    except Exception as e:
-        print(f"⚠️  송출 relay 시작 실패: {e}")
-        mbuf_proc.kill()
-        encode_proc.kill()
-        return None, []
-
-    mbuf_proc.stdout.close()
-    start_ffmpeg_log_thread(push_proc, name="ffmpeg:output-push")
-
-    print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL} (mbuffer 128MB 완충)")
+    print(f"📡 라이브 송출 시작 → {OUTPUT_STREAM_RTMP_URL}")
     print(
         f"   encoder={STREAM_VIDEO_ENCODER}  bitrate={bitrate['b:v']}  "
         f"maxrate={bitrate['maxrate']}  bufsize={bitrate['bufsize']}  cq={bitrate['cq']}"
     )
     print(f"   키프레임 간격: 약 {gop_size / fps:.1f}초 ({gop_size} 프레임)")
-    return encode_proc, [mbuf_proc, push_proc]
+    print(f"   송출 스풀: {spool_dir} (무손실, 끊기면 자동 재연결)")
+    return encode_proc, relay, "streaming"
 
 
 def stop_stream_process(proc):
@@ -739,9 +1164,11 @@ def make_spool_session_dirs():
     session_dir = os.path.join(SPOOL_ROOT_DIR, session_name)
     segments_dir = os.path.join(session_dir, "input_segments")
     markers_dir = os.path.join(session_dir, "processed_markers")
+    stream_spool_dir = os.path.join(session_dir, "stream_spool")
     os.makedirs(segments_dir, exist_ok=True)
     os.makedirs(markers_dir, exist_ok=True)
-    return session_dir, segments_dir, markers_dir
+    os.makedirs(stream_spool_dir, exist_ok=True)
+    return session_dir, segments_dir, markers_dir, stream_spool_dir
 
 
 def build_spool_record_command(stream_url, segments_dir):
@@ -1012,7 +1439,8 @@ def run_rtmp(state):
         print("❌ KEEP_INPUT_SEGMENTS=True 와 DELETE_INPUT_SEGMENTS_AFTER_PROCESS=True는 동시에 사용할 수 없습니다.")
         return
 
-    session_dir, segments_dir, markers_dir = make_spool_session_dirs()
+    (session_dir, segments_dir, markers_dir,
+     stream_spool_dir) = make_spool_session_dirs()
     print(f"📁 세션 폴더: {session_dir}")
 
     recorder_proc = start_spool_recorder(stream_url, segments_dir)
@@ -1023,7 +1451,7 @@ def run_rtmp(state):
 
     saved_out = None
     stream_proc = None
-    stream_relay_procs = []
+    stream_relay = None
     stream_status = "disabled"
     output_size = None
     output_fps = 0.0
@@ -1100,17 +1528,12 @@ def run_rtmp(state):
                             saved_out.release()
                             saved_out = None
 
-                    stream_proc, stream_relay_procs = start_output_stream_process(
+                    stream_proc, stream_relay, stream_status = start_output_stream_process(
                         output_size[0],
                         output_size[1],
                         output_fps,
+                        stream_spool_dir,
                     )
-                    if not OUTPUT_STREAM_ENABLED:
-                        stream_status = "disabled"
-                    elif stream_proc is None:
-                        stream_status = "start_failed"
-                    else:
-                        stream_status = "streaming"
 
                     print(f"   로컬 저장: {'ON' if saved_out else 'OFF'}")
                     if SAVE_STREAM_OUTPUT:
@@ -1154,12 +1577,14 @@ def run_rtmp(state):
                         try:
                             stream_proc.stdin.write(vis_for_output.tobytes())
                         except (BrokenPipeError, OSError):
-                            print("⚠️  유튜브 송출 연결이 끊겼습니다. 로컬 저장만 계속 진행합니다.")
+                            # 네트워크 문제는 relay가 흡수/재연결하므로,
+                            # 여기까지 오는 것은 로컬 인코더가 죽은 경우다.
+                            print("⚠️  송출 인코더가 종료되었습니다. 로컬 저장만 계속 진행합니다.")
+                            if stream_relay is not None:
+                                stream_relay.stop()
+                                stream_relay = None
                             stop_stream_process(stream_proc)
-                            for relay_proc in stream_relay_procs:
-                                stop_stream_process(relay_proc)
                             stream_proc = None
-                            stream_relay_procs = []
                             stream_status = "disconnected"
 
                     output_frame_count += 1
@@ -1220,9 +1645,20 @@ def run_rtmp(state):
         if recorder_proc.poll() is None:
             stop_stream_process(recorder_proc)
         if stream_proc is not None:
+            # 인코더 입력을 닫아 남은 프레임을 스풀로 흘려보낸다.
+            try:
+                if stream_proc.stdin:
+                    stream_proc.stdin.close()
+            except Exception:
+                pass
+
+        if DRAIN_SPOOL_ON_EXIT:
+            drain_relays_on_exit(stream_relay)
+
+        if stream_relay is not None:
+            stream_relay.stop()
+        if stream_proc is not None:
             stop_stream_process(stream_proc)
-            for relay_proc in stream_relay_procs:
-                stop_stream_process(relay_proc)
             stream_proc = None
         if saved_out:
             saved_out.release()
@@ -1236,6 +1672,8 @@ def run_rtmp(state):
     if SAVE_STREAM_OUTPUT and saved_out is not None:
         print(f"   결과 저장 → {STREAM_OUTPUT_PATH}")
     print(f"   유튜브 송출 상태: {stream_status_text(stream_status)}")
+    if stream_relay is not None:
+        print(f"     └ {stream_relay.summary()}")
     print(f"   세션 폴더: {session_dir}")
 
 

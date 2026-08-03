@@ -32,3 +32,5 @@ segmentation DL model/line_seg/
 *.engine
 *.onnx
 segmentation DL model/line_seg/
+spool_capture_sessions/
+logs/

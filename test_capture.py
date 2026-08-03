@@ -6,7 +6,7 @@
 
 import cv2
 
-CAM_NUM = 2     # None으로 두면 자동 탐색 후 가장 큰 인덱스(마지막 카메라)를 사용
+CAM_NUM = 0     # None으로 두면 자동 탐색 후 가장 큰 인덱스(마지막 카메라)를 사용
 
 
 def find_capture_devices(max_index=5):
@@ -40,9 +40,13 @@ def main():
         print(f"📷 장치 {cam_index} 번으로 연결 시도...\n")
 
     cap = cv2.VideoCapture(cam_index)
+    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*'MJPG'))
     cap.set(cv2.CAP_PROP_FRAME_WIDTH,  1920)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, 1080)
     cap.set(cv2.CAP_PROP_FPS, 30)
+
+    fourcc = int(cap.get(cv2.CAP_PROP_FOURCC))
+    print(f"   포맷: {''.join([chr((fourcc >> 8*i) & 0xFF) for i in range(4)])}")
 
     w   = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h   = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))

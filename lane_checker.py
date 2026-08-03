@@ -134,7 +134,7 @@ def get_centerline(mask_bin, min_aspect=CENTERLINE_MIN_ASPECT):
 
     projections = (pts - center) @ axis
     span  = projections.max() - projections.min()
-    width = ((pts - center) @ perp).ptp()
+    width = np.ptp((pts - center) @ perp)
 
     if width == 0:
         return None
