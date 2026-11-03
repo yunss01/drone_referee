@@ -1,0 +1,5 @@
+# CUDA 지원 PyTorch / torchvision은 장비 환경에 맞게 먼저 설치하세요.
+numpy
+opencv-python
+ultralytics
+yt-dlp

@@ -11,8 +11,8 @@ import os
 MODE = 'camera'
 
 # [image 모드] 입력 이미지 폴더 / 출력 폴더
-IMAGE_INPUT_DIR  = 'pre_process/frames_raw/'
-IMAGE_OUTPUT_DIR = 'pre_process/frames_clahe/'
+IMAGE_INPUT_DIR  = 'training/preprocessing/frames_raw/'
+IMAGE_OUTPUT_DIR = 'training/preprocessing/frames_clahe/'
 
 # [video 모드] 입력 영상 파일 경로
 VIDEO_PATH = 'drone_video.mp4'

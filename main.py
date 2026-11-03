@@ -27,6 +27,7 @@ import faulthandler
 from collections import deque
 import numpy as np
 from ultralytics import YOLO
+from runtime_config import get_setting
 
 try:
     import resource
@@ -60,14 +61,14 @@ IMAGE_OUTPUT = "result_images/"
 # OUTPUT_STREAM_RTMP_URL  : 유튜브 라이브 송출 주소
 # SAVE_STREAM_OUTPUT      : 추론된 결과 영상을 로컬 mp4로 저장할지 여부
 # STREAM_OUTPUT_PATH      : 로컬 저장 파일 경로
-INPUT_STREAM_URL       = "https://youtube.com/live/--fQWyY7W-k" # 드론 영상 유튜브 라이브 링크
+INPUT_STREAM_URL       = get_setting("DRONE_INPUT_STREAM_URL") # 드론 영상 유튜브 라이브 링크
 INPUT_STREAM_FORMAT    = (
     "bestvideo[height<=1080][vcodec*=avc1]/"
     "best[height<=1080][vcodec*=avc1]/"
     "bestvideo[height<=1080]/best[height<=1080]/bestvideo/best"
 )
 OUTPUT_STREAM_ENABLED  = True
-OUTPUT_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fsj7" # 성균관대학교노승윤 계정
+OUTPUT_STREAM_RTMP_URL = get_setting("DRONE_OUTPUT_STREAM_RTMP_URL") # 성균관대학교노승윤 계정
 SAVE_STREAM_OUTPUT     = False
 STREAM_OUTPUT_PATH     = "rtmp_result.mp4"
 RUNTIME_LOG_PATH       = "logs/drone_referee_runtime.log"

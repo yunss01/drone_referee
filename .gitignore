@@ -1,36 +1,64 @@
+# 로컬 설정과 개발 도구
+/local_settings.json
+.env
+.env.*
+!.env.example
+/.agents/
+/.codex/
+.venv/
+venv/
+.idea/
+.vscode/
+
+# Python / 빌드 산출물
+__pycache__/
+*.py[cod]
+.pytest_cache/
+*.egg-info/
+.eggs/
 build/
+dist/
 devel/
 install/
-log/
-__pycache__/
-*.bag
-*.mp4
-drone_Referee.v2i.yolov8/
-wheel_runs2/
-test_results/
-test/
-frames_clahe2/
-frames_raw/
-UnLanedet/detect_results/
-UnLanedet/detect_results_adnet/
-UnLanedet/detect_results_adnet_low_conf/
-UnLanedet/detect_results_finetuned/
-dataset/drone_lane/
-*.pth
-UnLanedet/output/
-UnLanedet/pretrained/
-UnLanedet/.eggs/
-UnLanedet/build/
-segmentation\ DL\ model/drone_Referee_line_seg.v1i.yolov8/
+
+# 로컬 보관 자료: 안내 문서만 Git으로 관리
+/archive/*
+!/archive/README.md
+/training/*
+!/training/README.md
+/dataset/*
+!/dataset/README.md
+/model/*
+!/model/README.md
+/특허용 자료들/
+
+# 운영 로그, 임시 스풀, 추론/학습 결과
+/logs/
+/log/
+/spool_sessions/
+/spool_capture_sessions/
+/test_results/
+/test/
+/frames_raw/
+/frames_clahe*/
+/wheel_runs*/
+/result_images/
+/runs/
 result*.jpg
+result*.png
+*.log
+*.done
+*.cache
+
+# 영상 / 모델 바이너리
+*.[mM][pP]4
+*.mkv
+*.avi
+*.mov
+*.ts
+*.bag
+*.pt
+*.pth
+*.onnx
+*.engine
 *.pkl
-dataset/
-test_results/
-*.onnx
-*.engine
-segmentation DL model/line_seg/
-*.engine
-*.onnx
-segmentation DL model/line_seg/
-spool_capture_sessions/
-logs/

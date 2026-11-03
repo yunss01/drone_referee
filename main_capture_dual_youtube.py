@@ -23,6 +23,7 @@ from collections import deque
 import cv2
 import numpy as np
 from ultralytics import YOLO
+from runtime_config import get_setting
 
 try:
     import resource
@@ -80,13 +81,13 @@ VIOLATION_HOLD_SEC = 0.1
 
 # 원본 라이브 송출
 RAW_STREAM_ENABLED = True
-RAW_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/9hdv-mff8-h2kv-uyhh-cv8u"  # 자동화연구실 계정
+RAW_STREAM_RTMP_URL = get_setting("DRONE_RAW_STREAM_RTMP_URL")  # 자동화연구실 계정
 SAVE_RAW_OUTPUT = False
 RAW_OUTPUT_PATH = "capture_raw_output.mp4"
 
 # 처리 결과 라이브 송출
 PROCESSED_STREAM_ENABLED = True
-PROCESSED_STREAM_RTMP_URL = "rtmp://a.rtmp.youtube.com/live2/e6m2-vfja-yz2m-sjab-fsj7"  # 성균관대학교노승윤 계정
+PROCESSED_STREAM_RTMP_URL = get_setting("DRONE_PROCESSED_STREAM_RTMP_URL")  # 성균관대학교노승윤 계정
 SAVE_PROCESSED_OUTPUT = False
 PROCESSED_OUTPUT_PATH = "capture_processed_output.mp4"
 
