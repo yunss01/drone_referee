@@ -21,15 +21,14 @@ dist/
 devel/
 install/
 
-# 로컬 보관 자료: 안내 문서만 Git으로 관리
-/archive/*
-!/archive/README.md
-/training/*
-!/training/README.md
+# 로컬 보관 자료
+/archive/
+/training/
+/docs/
 /dataset/*
-!/dataset/README.md
-/model/*
-!/model/README.md
+!/dataset/편집본/
+/dataset/편집본/*
+/model/
 /특허용 자료들/
 
 # 운영 로그, 임시 스풀, 추론/학습 결과
@@ -62,3 +61,6 @@ result*.png
 *.onnx
 *.engine
 *.pkl
+
+# 공개 테스트 영상은 Git LFS로 관리
+!/dataset/편집본/*.mp4
