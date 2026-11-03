@@ -28,6 +28,7 @@ from collections import deque
 import numpy as np
 from ultralytics import YOLO
 from runtime_config import get_setting
+from dash_referee import process_temporal
 
 try:
     import resource
@@ -41,7 +42,7 @@ from lane_checker import (
     get_instance_half_width, get_centerline,
     compute_distances, check_violation,
 )
-from violation_tracker import ViolationTracker
+from violation_tracker import ViolationTracker, VIOLATION_HOLD_SEC
 
 # ──────────────────────────────────────────────────────────
 #  모드 설정
@@ -101,8 +102,10 @@ REPOSITION_TOGGLE_DELAY_SEC = 0.0
 SEG_MODEL_PATH  = "model/best_seg_rev03_FP16.engine"
 POSE_MODEL_PATH = "model/best_referee_FP16.engine"
 MAX_WHEELS      = 4
+TEMPORAL_DASH_ENABLED = True  # False: 기존 프레임별 거리 판정
 SHOW_WINDOW     = False
 DRAW_LANE_VIS   = True # 점선 표시 여부
+SHOW_RESTORED_PAINT = False  # 진단용: True일 때만 보강한 점선을 파란색으로 표시
 
 # ── 프레임 스킵 설정 ──────────────────────────────────────
 # N프레임마다 한 번만 추론 (1 = 모든 프레임 추론, 6 = 6프레임마다 1번)
@@ -259,6 +262,11 @@ class RefereeState:
             self._apply_pending_locked()
             return self._paused
 
+    def reset_contacts(self):
+        with self._lock:
+            self.contact_reset_requested = True
+        print("\n[초기화] 다음 처리 프레임에서 바퀴 추적과 침범/이탈 상태를 초기화합니다.\n")
+
     def toggle(self):
         with self._lock:
             now = time.time()
@@ -278,13 +286,16 @@ class RefereeState:
 
 
 def start_input_listener(state: RefereeState):
-    print("💡 터미널에서 Enter 키를 누르면 재위치 모드 ON/OFF 전환")
+    print("💡 Enter: 재위치 모드 ON/OFF, r: 새 주행 바퀴·침범 상태 초기화")
 
     def _listen():
         while True:
             try:
-                input()
-                state.toggle()
+                command = input().strip().lower()
+                if command == "r":
+                    state.reset_contacts()
+                elif not command:
+                    state.toggle()
             except EOFError:
                 break
 
@@ -374,12 +385,12 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
 
     if DRAW_LANE_VIS:
         for data in lane_data:
-            color = (0, 200, 255)
+            color = (255, 180, 0) if SHOW_RESTORED_PAINT and data.get("restored") else (0, 200, 255)
             overlay = vis.copy()
             overlay[data["mask_bin"] > 0] = color
             vis = cv2.addWeighted(vis, 0.72, overlay, 0.28, 0)
             cv2.drawContours(vis, data["contours"], -1, (255, 255, 255), 1)
-            pt1, pt2 = data["centerline"]
+            pt1, pt2 = [tuple(np.rint(p).astype(int)) for p in data["centerline"]]
             draw_dashed_line(vis, pt1, pt2, (255, 255, 255), thickness=4)
             draw_dashed_line(vis, pt1, pt2, color, thickness=2)
 
@@ -393,7 +404,9 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
         if confirmed:
             any_confirmed = True
 
-        if confirmed:
+        if state.get("phase") == "unknown":
+            bbox_color = (150, 150, 150)
+        elif confirmed:
             bbox_color = (0, 0, 255)
         elif violated:
             bbox_color = (0, 128, 255)
@@ -404,8 +417,18 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
 
         cv2.rectangle(vis, (x1, y1), (x2, y2), bbox_color, 2)
         cv2.circle(vis, (kx, ky), 5, (0, 0, 255), -1)
+        if state.get("departure_active"):
+            cv2.putText(vis, f"W{state['wheel_id']} LINE OUT", (x1, max(16, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 0, 255), 1)
+        elif "intrusion_confirmed" in state:
+            cv2.putText(vis, f"W{state['wheel_id']}", (x1, max(16, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, bbox_color, 1)
+        elif "phase" in state:
+            phase_text = "EXIT" if state.get("exited") else state["phase"].upper()
+            cv2.putText(vis, f"W{state['wheel_id']} {phase_text}", (x1, max(16, y1 - 8)),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, bbox_color, 1)
 
-        if confirmed:
+        if confirmed and not state.get("departure_active"):
             cv2.putText(vis, f"VIOLATION {state['duration']*1000:.0f}ms",
                         (x1, y2 + 16),
                         cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 0, 255), 2)
@@ -414,8 +437,8 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
         cv2.putText(vis, "REPOSITIONING", (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, (0, 200, 255), 3)
     else:
-        status       = "VIOLATION" if any_confirmed else "NORMAL"
-        status_color = (0, 0, 255) if any_confirmed else (0, 255, 0)
+        status       = "LINE OUT" if any(s.get("departure_active") for s in tracker_states) else "VIOLATION" if any_confirmed else ("UNKNOWN" if any(s.get("phase") == "unknown" for s in tracker_states) else "NORMAL")
+        status_color = (0, 0, 255) if any_confirmed else ((150, 150, 150) if status == "UNKNOWN" else (0, 255, 0))
         cv2.putText(vis, status, (10, 40),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.2, status_color, 3)
 
@@ -430,10 +453,16 @@ def draw_frame(frame, lane_data, wheels, tracker_states, paused):
 
 
 # ── 프레임 1장 처리 ──────────────────────────────────────
-def process_frame(seg_model, wheel_det, trackers, frame, state: RefereeState):
+def process_frame(seg_model, wheel_det, trackers, frame, state: RefereeState, timestamp_sec=None):
     lane_data = build_lane_data(seg_model, frame)
     wheels    = wheel_det.predict(frame)
     paused    = state.paused
+
+    if TEMPORAL_DASH_ENABLED:
+        result = process_temporal(state, frame, lane_data, wheels[:MAX_WHEELS],
+                                  VIOLATION_HOLD_SEC, timestamp_sec, paused)
+        vis = draw_frame(frame, result["lanes"], result["wheels"], result["states"], paused)
+        return vis, result["states"]
 
     tracker_states = []
     for w_idx, wheel in enumerate(wheels[:MAX_WHEELS]):
@@ -1334,7 +1363,7 @@ def run_video(state):
         fps_ctr.tick()
         frame = _apply_clahe(frame, clahe)
         vis, tracker_states = process_frame(
-            seg_model, wheel_det, trackers, frame, state
+            seg_model, wheel_det, trackers, frame, state, timestamp_sec=frame_idx / fps
         )
         out.write(vis)
 
@@ -1404,6 +1433,8 @@ def run_image(state):
 
         for t in trackers:
             t.reset()
+        if hasattr(state, "dash_referee"):
+            state.dash_referee.reset()
 
         frame = _apply_clahe(frame, clahe)
         vis, _ = process_frame(seg_model, wheel_det, trackers, frame, state)
@@ -1465,6 +1496,7 @@ def run_rtmp(state):
     total_processed_segments = 0
     total_processed_frames = 0
     last_wait_log_at = 0.0
+    media_time_sec = 0.0
 
     try:
         while True:
@@ -1501,6 +1533,8 @@ def run_rtmp(state):
                 meta = probe_segment(segment_path)
                 if meta is None:
                     print(f"⚠️  세그먼트 메타데이터 확인 실패: {segment_path}")
+                    if hasattr(state, "dash_referee"):
+                        state.dash_referee.reset()
                     mark_segment_processed(segment_path, markers_dir)
                     continue
 
@@ -1549,14 +1583,21 @@ def run_rtmp(state):
                 cap = cv2.VideoCapture(segment_path)
                 if not cap.isOpened():
                     print(f"⚠️  세그먼트를 열 수 없습니다: {segment_path}")
+                    if hasattr(state, "dash_referee"):
+                        state.dash_referee.reset()
                     mark_segment_processed(segment_path, markers_dir)
                     continue
 
                 segment_written = 0
+                segment_frame_index = 0
+                segment_start_sec = media_time_sec
                 while True:
                     ret, frame = cap.read()
                     if not ret:
                         break
+
+                    timestamp_sec = segment_start_sec + segment_frame_index / meta["fps"]
+                    segment_frame_index += 1
 
                     if frame_idx % FRAME_SKIP != 0:
                         frame_idx += 1
@@ -1565,7 +1606,7 @@ def run_rtmp(state):
                     fps_ctr.tick()
                     frame = _apply_clahe(frame, clahe)
                     vis, _ = process_frame(
-                        seg_model, wheel_det, trackers, frame, state
+                        seg_model, wheel_det, trackers, frame, state, timestamp_sec=timestamp_sec
                     )
                     vis_for_output = vis
                     if (vis.shape[1], vis.shape[0]) != output_size:
@@ -1619,6 +1660,7 @@ def run_rtmp(state):
                             raise KeyboardInterrupt
 
                 cap.release()
+                media_time_sec = segment_start_sec + segment_frame_index / meta["fps"]
                 mark_segment_processed(segment_path, markers_dir)
                 total_processed_segments += 1
 
